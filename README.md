@@ -160,6 +160,7 @@ find the Profile folder location in AIMP's settings.)
 | `Timestamp` | bool | Show playback timestamps. `0` = elapsed time, `1` = remaining time. |
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
 | `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the offline built-in asset. `1` = allow online lookups. |
+| `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
 | `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **song title** (the `state` line), `2` = **artist** (default). |
 | `DebugLog` | string | Optional file that receives the Discord IPC frame log, for diagnosing connection problems. Empty (the default) disables it. A bare filename is written next to the plugin DLL; an absolute path is used as given. |
 | `State.UsePlay` | bool | Show a small play badge. `0` = off, `1` = on. |
