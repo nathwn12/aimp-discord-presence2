@@ -47,12 +47,14 @@ the steps below.
   and elapsed/remaining time.
 - **Activity type: Listening.** Discord shows *"Listening to ..."* rather than
   *"Playing ..."*.
-- **Artist-first layout.** Line 1 is the app name, line 2 (`details`) is the
-  **artist** (the album when the artist tag is empty, or `AIMP` when both the
-  artist and album tags are empty), line 3 (`state`) is
-  the **album** (omitted when the album tag is empty), the **large image** is the
-  **album art**, and the **track title** is the large-image tooltip (omitted when
-  empty). With the default `StatusDisplayType=2` Discord renders the **artist**
+- **Artist -> song -> album layout.** Line 1 is the app name, line 2 (`details`)
+  is the **artist** (the track title when the artist tag is empty, or `AIMP`
+  when both are empty), line 3 (`state`) is the **song title** (the album when
+  the title tag is empty or would repeat the artist line), the **large image**
+  is the **album art**, and its tooltip (`large_text`) is the **album**
+  (omitted when it would repeat either line). No line repeats a value already
+  shown on another line, so a self-titled track cannot print the same text
+  twice. With the default `StatusDisplayType=2` Discord renders the **artist**
   in the member-list status line.
 - **Album art from the internet.** Art is resolved on demand from keyless public
   APIs - **[Deezer](https://developers.deezer.com/api)** `/search/album` first,
@@ -158,7 +160,7 @@ find the Profile folder location in AIMP's settings.)
 | `Timestamp` | bool | Show playback timestamps. `0` = elapsed time, `1` = remaining time. |
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
 | `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the offline built-in asset. `1` = allow online lookups. |
-| `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **album**, `2` = **artist** (default). |
+| `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **song title** (the `state` line), `2` = **artist** (default). |
 | `DebugLog` | string | Optional file that receives the Discord IPC frame log, for diagnosing connection problems. Empty (the default) disables it. A bare filename is written next to the plugin DLL; an absolute path is used as given. |
 | `State.UsePlay` | bool | Show a small play badge. `0` = off, `1` = on. |
 | `State.PlayImage` | string | Image used for the play badge (a bundled asset name or a URL). |
@@ -183,7 +185,7 @@ UseAlbumArt=1
 ; Allow network album-art lookups (Deezer, then iTunes, then MusicBrainz). 0 = always use the offline asset. Default: 1
 UseAlbumArtOnline=1
 
-; Member-list status text: 0 = app name / 1 = album / 2 = artist. Default: 2
+; Member-list status text: 0 = app name / 1 = song title / 2 = artist. Default: 2
 StatusDisplayType=2
 
 ; Small status badges.

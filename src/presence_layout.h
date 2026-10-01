@@ -25,13 +25,17 @@
 
 // The Discord presence field mapping, kept in one place:
 //
-//   details    (line 2)  the artist; falls back to the album, then to the
-//                        literal "AIMP", so the line is never blank
-//   state      (line 3)  the album; empty means "omit the field entirely"
-//   large_text           the track title (the album-art tooltip); empty is
-//                        omitted
+//   details    (line 2)  the artist; falls back to the track title, then to
+//                        the literal "AIMP", so the line is never blank
+//   state      (line 3)  the track title; falls back to the album, and is
+//                        omitted when that would repeat `details`
+//   large_text           the album (the album-art tooltip); omitted when it
+//                        would repeat `details` or `state`
 //   large_image          the resolved album art URL; the bundled `aimp` asset
 //                        when no art was resolved
+//
+// No field repeats a value already emitted by an earlier one; empty values
+// count as absent.
 //
 // With status_display_type = 2 (Details), Discord renders `details` - the
 // artist - in the member-list status line.
@@ -41,24 +45,39 @@ namespace PresenceLayout {
 // layer so the fallback policy does not depend on the resolver.
 constexpr const char* kFallbackLargeImageKey = "aimp";
 
-// Literal shown on line 2 when both the artist and album tags are empty.
+// Literal shown on line 2 when both the artist and track title tags are empty.
 constexpr const char* kFallbackDetails = "AIMP";
 
 struct TextFields {
-  std::string details;     // artist, else album, else kFallbackDetails
-  std::string state;       // album; empty omits the field
-  std::string large_text;  // track title; empty omits the field
+  std::string details;     // artist, else title, else kFallbackDetails
+  std::string state;       // title, else album; empty omits the field
+  std::string large_text;  // album; empty omits the field
 };
 
-// Artist First -> Album Next -> the literal "AIMP" when both are missing.
+// Artist -> song title -> album, de-duplicated. `details` is never empty;
+// `state` falls back to the album only when the title would repeat `details`;
+// `large_text` is dropped when the album would repeat either line.
 inline TextFields BuildTextFields(const std::string& artist,
                                   const std::string& album,
                                   const std::string& title) {
   TextFields fields;
   fields.details = !artist.empty() ? artist
-                                   : (!album.empty() ? album : kFallbackDetails);
-  fields.state = album;
-  fields.large_text = title;
+                                   : (!title.empty() ? title : kFallbackDetails);
+
+  fields.state = title;
+  if (fields.state.empty() || fields.state == fields.details) {
+    fields.state = album;
+  }
+  if (fields.state.empty() || fields.state == fields.details) {
+    fields.state.clear();
+  }
+
+  fields.large_text = album;
+  if (fields.large_text.empty() || fields.large_text == fields.details ||
+      fields.large_text == fields.state) {
+    fields.large_text.clear();
+  }
+
   return fields;
 }
 
