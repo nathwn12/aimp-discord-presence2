@@ -158,6 +158,7 @@ find the Profile folder location in AIMP's settings.)
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
 | `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the offline built-in asset. `1` = allow online lookups. |
 | `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **album**, `2` = **artist** (default). |
+| `DebugLog` | string | Optional file that receives the Discord IPC frame log, for diagnosing connection problems. Empty (the default) disables it. A bare filename is written next to the plugin DLL; an absolute path is used as given. |
 | `State.UsePlay` | bool | Show a small play badge. `0` = off, `1` = on. |
 | `State.PlayImage` | string | Image used for the play badge (a bundled asset name or a URL). |
 | `State.UsePause` | bool | Show a small pause badge. `0` = off, `1` = on. |

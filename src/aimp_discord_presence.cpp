@@ -54,6 +54,52 @@ bool IsStreamUrl(const std::wstring& url) {
   return url.size() >= 8 && url.compare(0, 8, L"https://") == 0;
 }
 
+// Drive-absolute ("C:\x") or UNC ("\\server\x") paths are used as configured;
+// anything else is resolved below the plugin DLL's directory.
+bool IsAbsolutePath(const std::wstring& path) {
+  if (path.size() >= 3 && path[1] == L':' &&
+      (path[2] == L'\\' || path[2] == L'/')) {
+    return true;
+  }
+  return path.size() >= 2 && (path[0] == L'\\' || path[0] == L'/') &&
+         (path[1] == L'\\' || path[1] == L'/');
+}
+
+// Turns the configured DebugLog value into the UTF-8 path the IPC client
+// expects. Returns an empty string when the DLL directory cannot be
+// determined, in which case logging stays off rather than writing somewhere
+// unpredictable.
+std::string ResolveDebugLogPath(const std::wstring& configured) {
+  if (configured.empty()) {
+    return std::string();
+  }
+  if (IsAbsolutePath(configured)) {
+    return Utils::ToString(configured);
+  }
+
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCSTR>(&ResolveDebugLogPath),
+                          &module)) {
+    return std::string();
+  }
+
+  char module_path[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameA(module, module_path, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) {
+    return std::string();
+  }
+
+  std::string directory(module_path, length);
+  const size_t separator = directory.find_last_of("\\/");
+  if (separator == std::string::npos) {
+    return std::string();
+  }
+
+  return directory.substr(0, separator + 1) + Utils::ToString(configured);
+}
+
 }  // namespace
 
 __declspec(dllexport) HRESULT WINAPI AIMPPluginGetHeader(void** Header) {
@@ -88,6 +134,13 @@ bool AimpDiscordPresence::Load() {
 
   client_.reset(new DiscordIpc::Client(std::to_string(settings.application_id)));
 
+  // Opt-in frame log. The client writes nothing while the setting is empty
+  // and silently ignores a path it cannot open, so a bad value cannot
+  // disturb the connection.
+  if (!settings.debug_log.empty()) {
+    client_->SetLogPath(ResolveDebugLogPath(settings.debug_log));
+  }
+
   album_art_.SetCallback(
       [this](const std::string& artist, const std::string& album, const std::string& url) {
         ApplyResolvedArtwork(artist, album, url);
@@ -108,6 +161,7 @@ void AimpDiscordPresence::LoadConfig() {
   LoadConfigValue(config, L"DiscordPresence\\UseAlbumArt", &settings.use_albumart);
   LoadConfigValue(config, L"DiscordPresence\\UseAlbumArtOnline", &settings.use_albumart_online);
   LoadConfigValue(config, L"DiscordPresence\\StatusDisplayType", &settings.status_display_type);
+  LoadConfigValue(config, L"DiscordPresence\\DebugLog", &settings.debug_log);
   LoadConfigValue(config, L"DiscordPresence\\State.UsePlay", &settings.status.use_play);
   LoadConfigValue(config, L"DiscordPresence\\State.PlayImage", &settings.status.play_image);
   LoadConfigValue(config, L"DiscordPresence\\State.UsePause", &settings.status.use_pause);

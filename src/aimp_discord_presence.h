@@ -93,6 +93,10 @@ class AimpDiscordPresence :
     // What the member-list status line shows: 0 = name, 1 = state (album),
     // 2 = details (artist). Defaults to 2, the artist-first layout.
     int status_display_type = 2;
+    // Optional file for the Discord IPC frame log. Empty (the default) leaves
+    // logging off. A bare filename resolves next to the plugin DLL; an
+    // absolute path is used as given.
+    std::wstring debug_log;
     struct State {
       bool use_play = false;
       std::wstring play_image = L"aimp_play";
