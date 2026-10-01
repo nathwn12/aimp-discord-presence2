@@ -57,18 +57,12 @@ with others" must be on, or nothing will show.
 
 ## Screenshots
 
-![Screenshot 1](.github/screenshots/1.png)
-![Screenshot 2](.github/screenshots/2.png)
-
-![Screenshot 3](.github/screenshots/3.png)
-![Screenshot 4](.github/screenshots/4.png)
+![Screenshots](docs/preview/presence-preview.png)
 
 These four cards are rendered from the plugin's real captured payloads: two
 tracks whose own artwork was used, a keyless online match, and the black
 placeholder after a real search returned nothing. They are not a screenshot of
-anyone's Discord account, and no avatar or username was invented. The same four
-cards in one image are in
-[docs/preview/presence-preview.png](docs/preview/presence-preview.png).
+anyone's Discord account, and no avatar or username was invented.
 
 ## About this fork
 
