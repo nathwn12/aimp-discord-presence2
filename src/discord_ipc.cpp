@@ -761,6 +761,8 @@ void Client::SetLogging(bool enabled) {
   log_wanted_.store(enabled, std::memory_order_relaxed);
 }
 
+void Client::LogLine(const std::string& message) { Log(message); }
+
 void Client::Log(const std::string& message) {
   if (!LoggingEnabled()) {
     return;

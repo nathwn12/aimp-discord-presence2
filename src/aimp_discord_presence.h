@@ -31,6 +31,7 @@
 
 #include "album_art.h"
 #include "discord_ipc.h"
+#include "local_art.h"
 
 class AimpDiscordPresence :
   public Aimp::Implements<Aimp::Plugin, Aimp::ExternalSettingsDialog> {
@@ -79,6 +80,11 @@ class AimpDiscordPresence :
   // Called on AIMP's message thread: applies a newly resolved URL.
   bool ApplyPendingArtwork();
 
+  // Called on AIMP's message thread for a new track: extracts the local
+  // (tags/sidecar) cover just to fingerprint it in the DebugLog. Never
+  // uploads, decodes or alters the image.
+  void LogLocalArt(const TrackInfo& info);
+
  private:
   void LoadConfig();
 
@@ -126,6 +132,8 @@ class AimpDiscordPresence :
   std::string track_artist_;
   std::string track_album_;
   std::string last_large_image_;
+  // Last track whose local cover was fingerprinted; AIMP message thread only.
+  std::string local_art_key_;
   double sent_position_ = 0.0;
   int64_t sent_at_seconds_ = 0;
   bool paused_ = false;

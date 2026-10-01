@@ -81,6 +81,9 @@ class FileInfo {
   template <typename T>
   T Get(int property_id) const;
 
+  // The raw SDK object, for callers that hand it to another AIMP service.
+  IAIMPFileInfo* get() const { return info_; }
+
  private:
   IAIMPFileInfo* info_ = nullptr;
 };

@@ -286,6 +286,11 @@ class Client {
   void SetLogPath(const std::string& utf8_path);
   void SetLogging(bool enabled);
 
+  // Appends one caller-supplied line to the existing frame log (same file,
+  // same enabled flag, same format and mutex as the protocol lines). No-op
+  // while logging is off. Thread-safe.
+  void LogLine(const std::string& message);
+
  private:
   using Clock = std::chrono::steady_clock;
 

@@ -333,6 +333,14 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
     }
   }
 
+  // Observational only: fingerprint the local cover once per new track so the
+  // DebugLog proves the SDK hands us the file's own artwork bytes. It never
+  // touches the activity payload or the online resolver.
+  if (request_artwork && !info.is_url && info.key != local_art_key_) {
+    local_art_key_ = info.key;
+    LogLocalArt(info);
+  }
+
   SendActivity();
 }
 
@@ -417,21 +425,81 @@ void AimpDiscordPresence::ApplyResolvedArtwork(const std::string& artist, const 
 }
 
 bool AimpDiscordPresence::ApplyPendingArtwork() {
-  std::lock_guard<std::mutex> lock(presence_mutex_);
-  if (track_artist_.empty() || track_album_.empty() || artwork_url_.empty() ||
-      artwork_url_ == last_large_image_) {
-    return false;
+  std::string applied_url;
+  std::string applied_artist;
+  std::string applied_album;
+  {
+    std::lock_guard<std::mutex> lock(presence_mutex_);
+    if (track_artist_.empty() || track_album_.empty() || artwork_url_.empty() ||
+        artwork_url_ == last_large_image_) {
+      return false;
+    }
+
+    // The shared builder keeps this comparison in step with SetInfo(); artwork
+    // belongs to an album, not to the individual track on it.
+    if (artwork_key_ != AlbumArt::BuildAlbumKey(track_artist_, track_album_)) {
+      return false;
+    }
+
+    last_large_image_ = artwork_url_;
+    activity_.large_image = artwork_url_;
+    applied_url = artwork_url_;
+    applied_artist = track_artist_;
+    applied_album = track_album_;
   }
 
-  // The shared builder keeps this comparison in step with SetInfo(); artwork
-  // belongs to an album, not to the individual track on it.
-  if (artwork_key_ != AlbumArt::BuildAlbumKey(track_artist_, track_album_)) {
-    return false;
+  // Observational only: records which network URL the existing chain resolved
+  // for this album, so the log shows the online and local sources side by
+  // side. The activity itself is unchanged.
+  if (client_) {
+    client_->LogLine("online-art applied artist=\"" + applied_artist + "\" album=\"" +
+                     applied_album + "\" url=" + applied_url);
   }
-
-  last_large_image_ = artwork_url_;
-  activity_.large_image = artwork_url_;
   return true;
+}
+
+void AimpDiscordPresence::LogLocalArt(const TrackInfo& info) {
+  Aimp::Player::Service::Player player;
+  const Aimp::FileManager::FileInfo file_info = player.GetInfo();
+  IAIMPFileInfo* raw_info = file_info.get();
+
+  const std::wstring file =
+      file_info.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kFileName);
+  if (raw_info == nullptr || file.empty()) {
+    return;
+  }
+
+  IAIMPServiceAlbumArt* service =
+      Aimp::Detail::QueryService<IAIMPServiceAlbumArt>(IID_IAIMPServiceAlbumArt);
+  if (service == nullptr) {
+    return;
+  }
+
+  const LocalArt::Result art = LocalArt::Extract(service, raw_info);
+  service->Release();
+
+  std::string online_url;
+  {
+    std::lock_guard<std::mutex> lock(presence_mutex_);
+    online_url = artwork_url_;
+  }
+
+  std::string line = "local-art track=\"" + info.artist + " - " + info.title +
+                     "\" album=\"" + info.album + "\" file=\"" + Utils::ToString(file) + "\"";
+  if (art.found) {
+    line += " found=1 size=" + std::to_string(art.size) + " sha256=" + art.sha256_hex +
+            " format=" + art.format + " aimp_format=" + std::to_string(art.aimp_format) +
+            " dims=" + std::to_string(art.width) + "x" + std::to_string(art.height);
+  } else {
+    line += " found=0";
+  }
+  line += " provider=offline-only flags=WAITFOR|OFFLINE|ORIGINAL|NOCACHE online_url=\"";
+  line += online_url;
+  line += "\"";
+
+  if (client_) {
+    client_->LogLine(line);
+  }
 }
 
 void AimpDiscordPresence::SendActivity() {
