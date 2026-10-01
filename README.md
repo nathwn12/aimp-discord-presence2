@@ -62,7 +62,9 @@ the steps below.
   (upscaled `artworkUrl100`), then
   **[MusicBrainz](https://musicbrainz.org)** + **[Cover Art Archive](https://coverartarchive.org)**.
   Resolved art is cached in memory. If art cannot be resolved, or online lookups
-  are disabled, the plugin falls back to the bundled `aimp` asset.
+  are disabled, the plugin falls back to a solid black PNG hosted on GitHub
+  (Discord's bundled `aimp` asset belongs to an application this plugin does
+  not own, so the fallback is a URL).
 - **Small image / status badge.** Play, pause, and radio icons, each configurable.
   The radio badge is shown for URL streams and carries the text
   *"Listening to URL"*.
@@ -159,7 +161,7 @@ find the Profile folder location in AIMP's settings.)
 | `ApplicationID` | integer | Discord application ID used to publish the presence. The default is the shared upstream ID. You may substitute your own ID (create one in the [Discord developer portal](https://discord.com/developers/applications)). |
 | `Timestamp` | bool | Show playback timestamps. `0` = elapsed time, `1` = remaining time. |
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
-| `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the offline built-in asset. `1` = allow online lookups. |
+| `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the black fallback image. `1` = allow online lookups. |
 | `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
 | `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **song title** (the `state` line), `2` = **artist** (default). |
 | `DebugLog` | string | Optional file that receives the Discord IPC frame log, for diagnosing connection problems. Empty (the default) disables it. A bare filename is written next to the plugin DLL; an absolute path is used as given. |
@@ -222,7 +224,7 @@ enabled and AIMP has been restarted.
 The large image is filled from online lookups only when both `UseAlbumArt=1` and
 `UseAlbumArtOnline=1`. If `UseAlbumArtOnline=0`, or the track cannot be matched by
 the keyless providers (Deezer `/search/album`, iTunes Search, MusicBrainz + Cover
-Art Archive), the plugin falls back to the bundled `aimp` asset by design.
+Art Archive), the plugin falls back to a solid black PNG by design.
 
 **My configuration changes do nothing.**
 AIMP must be **closed** while you edit `Profile/AIMP.ini`. Reopen AIMP after

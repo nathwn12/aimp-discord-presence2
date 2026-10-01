@@ -369,7 +369,7 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   // thread once per new track, log its fingerprint, and either apply a URL
   // already known for that image or hand the bytes to the publisher worker.
   // A URL is only ever adopted when an upload proved retrievable, so the
-  // online chain's URL or the bundled asset stays in place until then. Runs
+  // online chain's URL or the black fallback stays in place until then. Runs
   // before SetInfo() so a known URL lands in this same update.
   if (request_artwork && info.key != local_art_key_) {
     local_art_key_ = info.key;
@@ -398,10 +398,12 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   track_file_ = info.file;
 
   if (request_artwork) {
-    if (settings.use_albumart && settings.use_albumart_online && !info.artist.empty() &&
-        !info.album.empty()) {
+    if (PresenceLayout::ShouldRequestOnlineArtwork(
+            settings.use_albumart, settings.use_albumart_online, info.artist,
+            info.album)) {
       // Non-blocking: the worker resolves the URL and publishes it, the next
-      // notification applies it.
+      // notification applies it. The album tag is not required: an album-less
+      // track still gets a keyless lookup, keyed by artist + file path.
       album_art_.Request(info.artist, info.album, info.file);
     } else {
       std::lock_guard<std::mutex> lock(presence_mutex_);
@@ -498,7 +500,7 @@ void AimpDiscordPresence::ApplyResolvedArtwork(const std::string& artist, const 
 bool AimpDiscordPresence::ApplyPendingArtwork() {
   // A finished publish, if any. The URL is adopted only when the publisher
   // proved the upload retrievable (Result.ok); a failure is logged and leaves
-  // the online chain or the bundled asset in place.
+  // the online chain's URL or the black fallback in place.
   {
     std::string hash;
     bool ok = false;
@@ -581,7 +583,7 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
 
 std::string AimpDiscordPresence::ResolveLargeImageLocked(const std::string& album_key,
                                                          std::string* source) const {
-  // The setting turns both sources off; the bundled asset then stays in place.
+  // The setting turns both sources off; the black fallback then stays in place.
   const std::string local_url = settings.use_albumart ? local_cover_url_ : std::string();
   const std::string online_url = settings.use_albumart ? artwork_url_ : std::string();
   return PresenceLayout::ResolveLargeImage(album_key, local_cover_key_, local_url,

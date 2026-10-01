@@ -198,18 +198,80 @@ void TestAlbumIdentityKeys() {
   const std::string other_key = AlbumArt::BuildAlbumKey(artist, "", other_file);
   Check(albumless_key != other_key, "two album-less files by one artist get different keys");
   Check(PresenceLayout::ResolveLargeImage(other_key, albumless_key, cover, "", "", &source) ==
-            PresenceLayout::kFallbackLargeImageKey,
+            PresenceLayout::kFallbackLargeImageUrl,
         "an album-less file cannot inherit another file's cover");
 
   // An album-less key never collides with a real album's key for the same
   // artist, in either direction, so neither can overwrite the other's cover.
   Check(albumless_key != album_key, "album-less key never equals a real album's key");
   Check(PresenceLayout::ResolveLargeImage(album_key, albumless_key, cover, "", "", &source) ==
-            PresenceLayout::kFallbackLargeImageKey,
+            PresenceLayout::kFallbackLargeImageUrl,
         "an album-less cover cannot overwrite a real album's stored cover");
   Check(PresenceLayout::ResolveLargeImage(albumless_key, album_key, cover, "", "", &source) ==
-            PresenceLayout::kFallbackLargeImageKey,
+            PresenceLayout::kFallbackLargeImageUrl,
         "a real album's cover cannot be applied to an album-less file");
+}
+
+// --- Final cover fallback chain: local -> online -> black PNG ---------------
+
+void TestCoverFallbackChain() {
+  const std::string artist = "ZWE1HVNDXR Feat yatashigang";
+  const std::string album = "LOVELY BASTARDS";
+  const std::string file =
+      "D:\\Software\\SoulseekQt\\downloads\\complete\\ZWE1HVNDXR Feat yatashigang - LOVELY BASTARDS.flac";
+  const std::string key = AlbumArt::BuildAlbumKey(artist, album, file);
+  const std::string local_url = "https://litter.catbox.moe/ofx201.jpg";
+  const std::string online_url =
+      "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
+  std::string source;
+
+  // (a) A published local cover wins; neither the online URL nor the black
+  // fallback is used.
+  const std::string local_win =
+      PresenceLayout::ResolveLargeImage(key, key, local_url, key, online_url, &source);
+  Check(local_win == local_url, "chain: local cover is the resolved image");
+  Check(source == "local", "chain: local cover names its source");
+  Check(local_win != online_url && local_win != PresenceLayout::kFallbackLargeImageUrl,
+        "chain: online and black are not used when local wins");
+
+  // (b) With no local cover, the online chain's URL is used; black is not.
+  const std::string online_win =
+      PresenceLayout::ResolveLargeImage(key, "", "", key, online_url, &source);
+  Check(online_win == online_url, "chain: online url is the resolved image");
+  Check(source == "online", "chain: online url names its source");
+  Check(online_win != PresenceLayout::kFallbackLargeImageUrl,
+        "chain: black is not used when online wins");
+
+  // (c) With neither source resolved, the black PNG URL is the last resort.
+  const std::string fallback =
+      PresenceLayout::ResolveLargeImage(key, "", "", "", "", &source);
+  Check(fallback == PresenceLayout::kFallbackLargeImageUrl,
+        "chain: black png url is the last resort");
+  Check(source == "fallback", "chain: last resort names its source");
+
+  // (d) The Task 1 regression: an album-less track with no local cover still
+  // triggers the online lookup (the album tag is not part of the gate), and
+  // its result is adopted under the file-path identity.
+  Check(PresenceLayout::ShouldRequestOnlineArtwork(true, true, artist, ""),
+        "chain: album-less track still triggers the online lookup");
+  const std::string albumless_key = AlbumArt::BuildAlbumKey(artist, "", file);
+  Check(PresenceLayout::ResolveLargeImage(albumless_key, "", "", albumless_key,
+                                          online_url, &source) == online_url &&
+            source == "online",
+        "chain: an album-less track adopts the online url");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(true, false, artist, ""),
+        "chain: online disabled never triggers a lookup");
+
+  // (e) The literal "aimp" - a foreign Discord application's bundled asset -
+  // is never the resolved image in any case.
+  Check(local_win != "aimp" && online_win != "aimp" && fallback != "aimp",
+        "chain: literal aimp is never the resolved image");
+  Check(std::string(PresenceLayout::kFallbackLargeImageUrl) != "aimp",
+        "chain: fallback constant is a url, never the aimp asset key");
+
+  // The fallback URL fits Discord's external-asset length limit.
+  Check(std::strlen(PresenceLayout::kFallbackLargeImageUrl) <= AlbumArt::kMaxUrlLength,
+        "chain: black png url fits the discord asset url limit");
 }
 
 // --- SHA-256 cache keys -----------------------------------------------------
@@ -503,6 +565,7 @@ int main(int argc, char** argv) {
   TestMultipartArithmetic();
   TestBoundary();
   TestAlbumIdentityKeys();
+  TestCoverFallbackChain();
   TestSha256();
   TestCompressionPlan();
   TestCompressionPreparation();

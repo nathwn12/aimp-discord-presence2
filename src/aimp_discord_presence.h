@@ -103,7 +103,7 @@ class AimpDiscordPresence :
 
   // Large-image value for `album_key`; must be called with presence_mutex_
   // held. A published local cover wins over the online chain's URL, which wins
-  // over the bundled asset. `source` names the winner for the DebugLog.
+  // over the black PNG fallback. `source` names the winner for the DebugLog.
   std::string ResolveLargeImageLocked(const std::string& album_key,
                                       std::string* source) const;
 
@@ -120,7 +120,7 @@ class AimpDiscordPresence :
     bool use_albumart_online = true;
     // Publishes the track's own (offline) cover for Discord to fetch.
     // Publishing is best effort and gated on the upload proving retrievable:
-    // when it fails, the online chain's URL (or the bundled asset) stays.
+    // when it fails, the online chain's URL (or the black fallback) stays.
     bool local_cover = true;
     // Optional file for the published-cover cache. Empty (the default) means
     // cover-cache.txt next to the plugin DLL; a bare or relative name resolves
@@ -158,8 +158,8 @@ class AimpDiscordPresence :
   std::string artwork_key_;
   std::string artwork_url_;
   // Published local cover, valid for one album key. Set from a publisher
-  // Result only when it reported ok, so a failure leaves the online chain (or
-  // the fallback asset) in place.
+  // Result only when it reported ok, so a failure leaves the online chain's
+  // URL (or the black fallback) in place.
   std::string local_cover_key_;
   std::string local_cover_url_;
 
