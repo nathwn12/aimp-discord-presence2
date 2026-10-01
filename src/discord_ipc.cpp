@@ -448,11 +448,13 @@ std::string NormalizeTextField(const std::string& utf8, size_t max_codepoints) {
 
 std::string BuildHandshakePayload(const std::string& application_id,
                                   const std::string& nonce) {
-  std::string payload = "{\"cmd\":\"HANDSHAKE\",\"nonce\":\"";
-  payload += EscapeJsonString(nonce);
-  payload += "\",\"args\":{\"v\":1,\"client_id\":\"";
+  // Opcode 0 is not a command frame: Discord reads `v` and `client_id` at the
+  // top level of a bare object and closes with 4000 (INVALID_CLIENTID) when
+  // they arrive inside the cmd/nonce/args envelope used by opcode 1.
+  (void)nonce;
+  std::string payload = "{\"v\":1,\"client_id\":\"";
   payload += EscapeJsonString(application_id);
-  payload += "\"}}";
+  payload += "\"}";
   return payload;
 }
 
