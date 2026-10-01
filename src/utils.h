@@ -37,16 +37,30 @@ struct Utils {
   }
 
   [[nodiscard]] static std::string ToString(const std::wstring& input) {
-    int count = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), static_cast<int>(input.length()), NULL, 0, NULL, NULL);
-    std::string tmp(count, 0);
-    WideCharToMultiByte(CP_UTF8, 0, input.c_str(), -1, &tmp[0], count, NULL, NULL);
+    if (input.empty()) {
+      return std::string();
+    }
+    const int length = static_cast<int>(input.length());
+    const int count = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), length, NULL, 0, NULL, NULL);
+    if (count <= 0) {
+      return std::string();
+    }
+    std::string tmp(static_cast<size_t>(count), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, input.c_str(), length, tmp.data(), count, NULL, NULL);
     return tmp;
   }
 
   [[nodiscard]] static std::wstring ToWString(const std::string& input) {
-    int count = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.length()), NULL, 0);
-    std::wstring tmp(count, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, &tmp[0], count);
+    if (input.empty()) {
+      return std::wstring();
+    }
+    const int length = static_cast<int>(input.length());
+    const int count = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), length, NULL, 0);
+    if (count <= 0) {
+      return std::wstring();
+    }
+    std::wstring tmp(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), length, tmp.data(), count);
     return tmp;
   }
 

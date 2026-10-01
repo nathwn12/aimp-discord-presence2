@@ -21,11 +21,16 @@
 #ifndef AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
 #define AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
 
+#include <memory>
+#include <mutex>
 #include <string>
 
 #include "aimp_implements.h"
 #include "aimp_plugin.h"
 #include "aimp_core.h"
+
+#include "album_art.h"
+#include "discord_ipc.h"
 
 class AimpDiscordPresence :
   public Aimp::Implements<Aimp::Plugin, Aimp::ExternalSettingsDialog> {
@@ -38,6 +43,14 @@ class AimpDiscordPresence :
   void ShowSettings(HWND parent_wnd) override;
 
  private:
+  struct TrackInfo {
+    std::string key;
+    std::string title;
+    std::string artist;
+    std::string album;
+    bool is_url = false;
+  };
+
   void OnStreamStartSubtrack();
   void OnPlayerState(DWORD message, int param1 = NULL);
   void OnPropertyValue(DWORD message, int param1 = NULL);
@@ -46,9 +59,24 @@ class AimpDiscordPresence :
   void InitializeMessageDispatcher();
 
  private:
-  void SetInfo();
-  void SetSmallImage(int state = -1);
-  void SetTimestamp();
+  // Rebuilds and queues the Discord presence. `request_artwork` starts a new
+  // album art lookup for the current track.
+  void RefreshPresence(bool request_artwork);
+  void SendActivity();
+
+  TrackInfo ReadTrackInfo();
+
+  // Fill the activity from AIMP's currently playing file. Must run on AIMP's
+  // message thread.
+  void SetInfo(const TrackInfo& info);
+  void SetSmallImage(const TrackInfo& info, int state = -1);
+  void SetTimestamp(const TrackInfo& info);
+
+  // Called on the album art worker thread: only publishes the value.
+  void ApplyResolvedArtwork(const std::string& artist, const std::string& album,
+                            const std::string& url);
+  // Called on AIMP's message thread: applies a newly resolved URL.
+  bool ApplyPendingArtwork();
 
  private:
   void LoadConfig();
@@ -60,6 +88,9 @@ class AimpDiscordPresence :
     int64_t application_id = 429559336982020107LL;
     bool timestamp = false;
     bool use_albumart = true;
+    bool use_albumart_online = true;
+    // 0 = name, 1 = state (artist), 2 = details (track title, Spotify-like).
+    int status_display_type = 2;
     struct State {
       bool use_play = false;
       std::wstring play_image = L"aimp_play";
@@ -73,6 +104,25 @@ class AimpDiscordPresence :
   };
 
   Properties settings;
+
+  std::unique_ptr<DiscordIpc::Client> client_;
+  AlbumArt::Resolver album_art_;
+
+  // Guards activity_ and the resolved artwork state, which is touched by the
+  // album art worker thread.
+  std::mutex presence_mutex_;
+  DiscordIpc::Activity activity_;
+  std::string artwork_key_;
+  std::string artwork_url_;
+
+  // AIMP message thread only.
+  std::string track_key_;
+  std::string track_artist_;
+  std::string track_album_;
+  std::string last_large_image_;
+  double sent_position_ = 0.0;
+  int64_t sent_at_seconds_ = 0;
+  bool paused_ = false;
 };
 
 #endif  // AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_

@@ -74,11 +74,11 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "Exle"
-            VALUE "FileDescription", "Plugin for AIMP"
+            VALUE "CompanyName", "Exle (original), nathwn12 (fork)"
+            VALUE "FileDescription", "AIMP Discord Presence"
             VALUE "FileVersion", PL_VERSION_STRING
             VALUE "InternalName", "aimp_discordPresence.dll"
-            VALUE "LegalCopyright", "Copyright (C) 2024, Exle"
+            VALUE "LegalCopyright", "Copyright (C) 2024 Exle; fork (C) 2026 nathwn12"
             VALUE "OriginalFilename", "aimp_discordPresence.dll"
             VALUE "ProductName", "AIMP Discord Presence"
             VALUE "ProductVersion", PL_VERSION_STRING
