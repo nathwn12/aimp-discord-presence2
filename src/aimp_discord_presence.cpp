@@ -192,6 +192,10 @@ bool AimpDiscordPresence::Load() {
              const std::string& file_path, const std::string& url) {
         ApplyResolvedArtwork(artist, album, file_path, url);
       });
+  // Online-rung diagnostics go through the same DebugLog path as the cover
+  // code; the hook is invoked on the resolver worker thread, never with image
+  // bytes.
+  album_art_.SetLogger([this](const std::string& line) { LogCover(line); });
   album_art_.SetOnlineEnabled(settings.use_albumart_online);
 
   client_->EnsureConnected();

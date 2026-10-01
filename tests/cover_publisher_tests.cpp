@@ -274,6 +274,97 @@ void TestCoverFallbackChain() {
         "chain: black png url fits the discord asset url limit");
 }
 
+// --- Online rung: decision outcomes (offline, pure functions) ---------------
+
+void TestOnlineRungDecision() {
+  const std::string artist = "Daft Punk";
+  const std::string album = "Discovery";
+  const std::string key = AlbumArt::BuildAlbumKey(artist, album, "");
+  std::string source;
+
+  // The request predicate: a cover-less track with a non-empty album is looked
+  // up. The album tag is not part of the gate, and neither is the local cover.
+  Check(PresenceLayout::ShouldRequestOnlineArtwork(true, true, artist, album),
+        "online rung: a cover-less albumed track triggers the lookup");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(false, true, artist, album),
+        "online rung: use_albumart off suppresses the lookup");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(true, false, artist, album),
+        "online rung: use_online off suppresses the lookup");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(true, true, "", album),
+        "online rung: an empty artist suppresses the lookup");
+
+  // Resolved: a provider hit that survives the identity guard yields its URL,
+  // and the resolved URL is what the plugin applies - black is not used.
+  const std::string deezer_body =
+      "{\"data\":[{\"title\":\"Discovery\",\"artist\":{\"name\":\"Daft Punk\"},"
+      "\"cover_xl\":\"https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg\"}],"
+      "\"total\":1}";
+  Check(AlbumArt::SearchResultMatches(deezer_body, AlbumArt::Provider::kDeezer, artist, album),
+        "online rung: a deezer hit for the requested album passes the guard");
+  const std::string deezer_url =
+      AlbumArt::ExtractArtworkUrl(deezer_body, AlbumArt::Provider::kDeezer);
+  Check(deezer_url ==
+            "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg",
+        "online rung: the deezer cover_xl url is the resolved url");
+  const std::string applied =
+      PresenceLayout::ResolveLargeImage(key, "", "", key, deezer_url, &source);
+  Check(applied == deezer_url && source == "online",
+        "online rung: a resolved url is applied as the online image");
+  Check(applied != PresenceLayout::kFallbackLargeImageUrl,
+        "online rung: black is not used when a provider resolved");
+
+  const std::string itunes_match =
+      "{\"resultCount\":1,\"results\":[{\"artistName\":\"Daft Punk\","
+      "\"collectionName\":\"Discovery\","
+      "\"artworkUrl100\":\"https://is1-ssl.mzstatic.com/image/thumb/Music/xyz/100x100bb.jpg\"}]}";
+  Check(AlbumArt::SearchResultMatches(itunes_match, AlbumArt::Provider::kItunes, artist, album),
+        "online rung: a matching itunes hit passes the guard");
+  Check(AlbumArt::ExtractArtworkUrl(itunes_match, AlbumArt::Provider::kItunes) ==
+            "https://is1-ssl.mzstatic.com/image/thumb/Music/xyz/600x600bb.jpg",
+        "online rung: the itunes artwork url is upscaled to 600x600");
+
+  // Not found: every provider answered and none matched, so the resolver
+  // reports no URL and the plugin falls back to the black PNG.
+  const std::string dbz_artist = "Dragon Ball Z";
+  const std::string dbz_album = "Dragon Ball Z BGM Collection Disc 1";
+  const std::string dbz_key = AlbumArt::BuildAlbumKey(dbz_artist, dbz_album, "");
+  const std::string empty_deezer = "{\"data\":[],\"total\":0}";
+  Check(!AlbumArt::SearchResultMatches(empty_deezer, AlbumArt::Provider::kDeezer, dbz_artist,
+                                       dbz_album),
+        "online rung: an empty deezer answer is not a match");
+  Check(AlbumArt::ExtractArtworkUrl(empty_deezer, AlbumArt::Provider::kDeezer).empty(),
+        "online rung: an empty deezer answer yields no url");
+
+  // The real-world iTunes case: a hit for another album must be rejected, not
+  // adopted. The guard is what keeps an unrelated cover off the card.
+  const std::string itunes_unrelated =
+      "{\"resultCount\":1,\"results\":[{\"artistName\":\"Dragon Ball Z\","
+      "\"collectionName\":\"Dragon '98 Special Live\","
+      "\"artworkUrl100\":\"https://is1-ssl.mzstatic.com/image/thumb/Music/abc/100x100bb.jpg\"}]}";
+  Check(!AlbumArt::SearchResultMatches(itunes_unrelated, AlbumArt::Provider::kItunes, dbz_artist,
+                                       dbz_album),
+        "online rung: an unrelated itunes hit is rejected by the identity guard");
+
+  const std::string musicbrainz_empty = "{\"count\":0,\"release-groups\":[]}";
+  Check(!AlbumArt::SearchResultMatches(musicbrainz_empty, AlbumArt::Provider::kMusicBrainz,
+                                       dbz_artist, dbz_album),
+        "online rung: an empty musicbrainz answer is not a match");
+  Check(AlbumArt::ExtractMusicBrainzReleaseGroupId(musicbrainz_empty).empty(),
+        "online rung: an empty musicbrainz answer yields no mbid");
+
+  const std::string fallback =
+      PresenceLayout::ResolveLargeImage(dbz_key, "", "", dbz_key, "", &source);
+  Check(fallback == PresenceLayout::kFallbackLargeImageUrl && source == "fallback",
+        "online rung: not-found falls back to the black png");
+  Check(fallback != deezer_url, "online rung: the fallback is not another album's url");
+
+  // A URL resolved for a different identity is never adopted for this one.
+  const std::string other_key = AlbumArt::BuildAlbumKey(artist, "Homework", "");
+  Check(PresenceLayout::ResolveLargeImage(key, "", "", other_key, deezer_url, &source) ==
+            PresenceLayout::kFallbackLargeImageUrl,
+        "online rung: another album's resolved url is never applied");
+}
+
 // --- SHA-256 cache keys -----------------------------------------------------
 
 void TestSha256() {
@@ -566,6 +657,7 @@ int main(int argc, char** argv) {
   TestBoundary();
   TestAlbumIdentityKeys();
   TestCoverFallbackChain();
+  TestOnlineRungDecision();
   TestSha256();
   TestCompressionPlan();
   TestCompressionPreparation();

@@ -708,6 +708,11 @@ void Resolver::SetCallback(Callback callback) {
   callback_ = std::move(callback);
 }
 
+void Resolver::SetLogger(Logger logger) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  logger_ = std::move(logger);
+}
+
 void Resolver::Request(const std::string& artist, const std::string& album,
                        const std::string& file_path) {
   {
@@ -728,8 +733,12 @@ std::string Resolver::Lookup(const std::string& artist, const std::string& album
                              const std::string& file_path) {
   const std::string key = BuildAlbumKey(artist, album, file_path);
 
+  Log("online-art requested artist=\"" + artist + "\" album=\"" + album + "\"");
+
   std::string cached;
   if (TakeCached(key, &cached)) {
+    // Only definitive answers are cached, so a cached empty URL is a real miss.
+    LogOutcome(artist, album, cached);
     return cached;
   }
 
@@ -737,8 +746,32 @@ std::string Resolver::Lookup(const std::string& artist, const std::string& album
   const std::string url = LookupUncached(artist, album, &definitive);
   if (definitive) {
     StoreCached(key, url);
+    // A transport failure is not definitive and deliberately logs no outcome:
+    // the same query is retried on the next request.
+    LogOutcome(artist, album, url);
   }
   return url;
+}
+
+void Resolver::Log(const std::string& line) {
+  Logger logger;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    logger = logger_;
+  }
+  if (logger) {
+    logger(line);
+  }
+}
+
+void Resolver::LogOutcome(const std::string& artist, const std::string& album,
+                          const std::string& url) {
+  if (url.empty()) {
+    Log("online-art not-found artist=\"" + artist + "\" album=\"" + album + "\"");
+    return;
+  }
+  Log("online-art resolved artist=\"" + artist + "\" album=\"" + album + "\" url=\"" +
+      url + "\"");
 }
 
 bool Resolver::TakeCached(const std::string& key, std::string* url) {

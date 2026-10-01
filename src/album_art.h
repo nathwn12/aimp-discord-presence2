@@ -137,6 +137,12 @@ class Resolver {
 
   void SetCallback(Callback callback);
 
+  // Diagnostics: one concise line per online lookup decision (requested,
+  // resolved, not-found); never image bytes. Invoked on the worker thread, so
+  // the callback must itself be thread-safe.
+  using Logger = std::function<void(const std::string&)>;
+  void SetLogger(Logger logger);
+
   // Queues a lookup for `artist` + `album` (UTF-8). `file_path` is the opaque
   // identity discriminator that keys the cache and is echoed to the callback.
   // Replaces any pending request; stale completions are dropped.
@@ -153,6 +159,10 @@ class Resolver {
   void WorkerMain();
   std::string LookupUncached(const std::string& artist, const std::string& album,
                              bool* definitive);
+  // Online-rung diagnostics; called on the worker thread.
+  void Log(const std::string& line);
+  void LogOutcome(const std::string& artist, const std::string& album,
+                  const std::string& url);
   // MusicBrainz allows one request per second; the worker is the only caller,
   // so an elapsed-time gate is enough to guarantee that.
   void WaitForMusicBrainzSlot();
@@ -176,6 +186,7 @@ class Resolver {
   std::string request_file_path_;
 
   Callback callback_;
+  Logger logger_;
 
   std::unordered_map<std::string, std::string> cache_;
   std::deque<std::string> cache_order_;
