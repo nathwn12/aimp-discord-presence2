@@ -28,6 +28,7 @@
 #include "aimp_filemanager.h"
 #include "aimp_messages.h"
 #include "aimp_player.h"
+#include "presence_layout.h"
 #include "utils.h"
 
 namespace {
@@ -285,16 +286,20 @@ void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
   activity_.type = static_cast<int>(DiscordIpc::ActivityType::kListening);
   activity_.status_display_type = settings.status_display_type;
 
-  // Spotify-like layout: details is the track title, state is the artist.
-  activity_.details = info.title;
-  activity_.state = info.artist;
-  activity_.large_text = info.album;
+  // Artist First -> Album Next: details is the artist (falling back to the
+  // track title), state is the album, and the track title is the large-image
+  // tooltip. Empty values omit their field.
+  const PresenceLayout::TextFields fields =
+      PresenceLayout::BuildTextFields(info.artist, info.album, info.title);
+  activity_.details = fields.details;
+  activity_.state = fields.state;
+  activity_.large_text = fields.large_text;
 
-  std::string large_image = AlbumArt::kDefaultAssetKey;
-  if (settings.use_albumart && !artwork_url_.empty() &&
-      artwork_key_ == AlbumArt::BuildAlbumKey(info.artist, info.album)) {
-    large_image = artwork_url_;
-  }
+  const bool art_matches =
+      settings.use_albumart && !artwork_url_.empty() &&
+      artwork_key_ == AlbumArt::BuildAlbumKey(info.artist, info.album);
+  const std::string large_image =
+      PresenceLayout::BuildLargeImage(art_matches ? artwork_url_ : std::string());
   activity_.large_image = large_image;
   last_large_image_ = large_image;
 }

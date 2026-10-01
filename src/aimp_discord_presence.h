@@ -90,7 +90,8 @@ class AimpDiscordPresence :
     bool timestamp = false;
     bool use_albumart = true;
     bool use_albumart_online = true;
-    // 0 = name, 1 = state (artist), 2 = details (track title, Spotify-like).
+    // What the member-list status line shows: 0 = name, 1 = state (album),
+    // 2 = details (artist). Defaults to 2, the artist-first layout.
     int status_display_type = 2;
     struct State {
       bool use_play = false;

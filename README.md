@@ -47,15 +47,19 @@ the steps below.
   and elapsed/remaining time.
 - **Activity type: Listening.** Discord shows *"Listening to ..."* rather than
   *"Playing ..."*.
-- **Spotify-style layout.** Line 1 is the app name, line 2 (`details`) is the
-  **track title**, line 3 (`state`) is the **artist**, the **large image** is the
-  **album art**, and the **album name** is the large-image tooltip.
+- **Artist-first layout.** Line 1 is the app name, line 2 (`details`) is the
+  **artist** (the track title when the artist tag is empty), line 3 (`state`) is
+  the **album** (omitted when the album tag is empty), the **large image** is the
+  **album art**, and the **track title** is the large-image tooltip (omitted when
+  empty). With the default `StatusDisplayType=2` Discord renders the **artist**
+  in the member-list status line.
 - **Album art from the internet.** Art is resolved on demand from keyless public
-  APIs - **[Deezer](https://developers.deezer.com/api)** as the primary source
-  (`cover_xl`) and the **[iTunes Search API](https://performance-partners.apple.com/search-api)**
-  as a fallback (upscaled `artworkUrl100`). Resolved art is cached in memory. If
-  art cannot be resolved, or online lookups are disabled, the plugin falls back to
-  the bundled `aimp` asset.
+  APIs - **[Deezer](https://developers.deezer.com/api)** `/search/album` first,
+  then the **[iTunes Search API](https://performance-partners.apple.com/search-api)**
+  (upscaled `artworkUrl100`), then
+  **[MusicBrainz](https://musicbrainz.org)** + **[Cover Art Archive](https://coverartarchive.org)**.
+  Resolved art is cached in memory. If art cannot be resolved, or online lookups
+  are disabled, the plugin falls back to the bundled `aimp` asset.
 - **Small image / status badge.** Play, pause, and radio icons, each configurable.
   The radio badge is shown for URL streams and carries the text
   *"Listening to URL"*.
@@ -152,8 +156,8 @@ find the Profile folder location in AIMP's settings.)
 | `ApplicationID` | integer | Discord application ID used to publish the presence. The default is the shared upstream ID. You may substitute your own ID (create one in the [Discord developer portal](https://discord.com/developers/applications)). |
 | `Timestamp` | bool | Show playback timestamps. `0` = elapsed time, `1` = remaining time. |
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
-| `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes). `0` = never go online; always use the offline built-in asset. `1` = allow online lookups. |
-| `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **artist**, `2` = **track title** (default, Spotify-like). |
+| `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the offline built-in asset. `1` = allow online lookups. |
+| `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **album**, `2` = **artist** (default). |
 | `State.UsePlay` | bool | Show a small play badge. `0` = off, `1` = on. |
 | `State.PlayImage` | string | Image used for the play badge (a bundled asset name or a URL). |
 | `State.UsePause` | bool | Show a small pause badge. `0` = off, `1` = on. |
@@ -174,10 +178,10 @@ Timestamp=0
 ; Use the album art as the large image. Default: 1
 UseAlbumArt=1
 
-; Allow network album-art lookups (Deezer, then iTunes). 0 = always use the offline asset. Default: 1
+; Allow network album-art lookups (Deezer, then iTunes, then MusicBrainz). 0 = always use the offline asset. Default: 1
 UseAlbumArtOnline=1
 
-; Member-list status text: 0 = app name / 1 = artist / 2 = track title. Default: 2
+; Member-list status text: 0 = app name / 1 = album / 2 = artist. Default: 2
 StatusDisplayType=2
 
 ; Small status badges.
@@ -211,9 +215,9 @@ enabled and AIMP has been restarted.
 
 **Album art is missing.**
 The large image is filled from online lookups only when both `UseAlbumArt=1` and
-`UseAlbumArtOnline=1`. If `UseAlbumArtOnline=0`, or the track cannot be matched on
-Deezer or the iTunes Search API, the plugin falls back to the bundled `aimp`
-asset by design.
+`UseAlbumArtOnline=1`. If `UseAlbumArtOnline=0`, or the track cannot be matched by
+the keyless providers (Deezer `/search/album`, iTunes Search, MusicBrainz + Cover
+Art Archive), the plugin falls back to the bundled `aimp` asset by design.
 
 **My configuration changes do nothing.**
 AIMP must be **closed** while you edit `Profile/AIMP.ini`. Reopen AIMP after
