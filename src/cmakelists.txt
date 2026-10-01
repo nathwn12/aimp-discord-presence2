@@ -1,10 +1,8 @@
 set( TARGET_NAME "aimp_discordPresence" )
 if( X86 )
-  set( DISCORD_ARCH "32" )
   set( RUNTIME_OUTPUT_DIR_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../output/Release/${TARGET_NAME}" )
   set( RUNTIME_OUTPUT_DIR_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/../output/Debug/${TARGET_NAME}" )
 else()
-  set( DISCORD_ARCH "64" )
   set( RUNTIME_OUTPUT_DIR_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../output/Release/${TARGET_NAME}/x64" )
   set( RUNTIME_OUTPUT_DIR_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/../output/Debug/${TARGET_NAME}/x64" )
 endif()
@@ -43,14 +41,19 @@ file( GLOB SOURCE_FILES
   *.def
 )
 
+# In-repo glue over the official AIMP SDK headers; replaces the retired
+# lib/aimp-sdk-cpp-wrapper submodule.
+list( APPEND SOURCE_FILES
+  ${LIB_DIR}/aimp-glue/aimp_glue.cpp
+)
+
 add_library( ${TARGET_NAME} SHARED ${SOURCE_FILES} )
 target_include_directories( ${TARGET_NAME} PUBLIC
   ${LIB_DIR}/aimp-sdk/Sources/Cpp
-  ${LIB_DIR}/aimp-sdk-cpp-wrapper/
-  ${LIB_DIR}/discord-rpc/win${DISCORD_ARCH}-static/include
+  ${LIB_DIR}/aimp-glue
 )
 
-target_link_libraries( ${TARGET_NAME} PRIVATE ${LIB_DIR}/discord-rpc/win${DISCORD_ARCH}-static/lib/discord-rpc.lib )
+target_link_libraries( ${TARGET_NAME} PRIVATE winhttp )
 
 set_target_properties( ${TARGET_NAME}
   PROPERTIES

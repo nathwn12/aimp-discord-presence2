@@ -1,6 +1,3 @@
-[submodule "lib/aimp-sdk-cpp-wrapper"]
-	path = lib/aimp-sdk-cpp-wrapper
-	url = https://github.com/Exle/aimp-sdk-cpp-wrapper
 [submodule "lib/aimp-sdk"]
 	path = lib/aimp-sdk
 	url = https://github.com/Exle/aimp-sdk
