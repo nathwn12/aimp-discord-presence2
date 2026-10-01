@@ -188,8 +188,9 @@ bool AimpDiscordPresence::Load() {
   cover_worker_ = std::thread(&AimpDiscordPresence::CoverWorkerMain, this);
 
   album_art_.SetCallback(
-      [this](const std::string& artist, const std::string& album, const std::string& url) {
-        ApplyResolvedArtwork(artist, album, url);
+      [this](const std::string& artist, const std::string& album,
+             const std::string& file_path, const std::string& url) {
+        ApplyResolvedArtwork(artist, album, file_path, url);
       });
   album_art_.SetOnlineEnabled(settings.use_albumart_online);
 
@@ -349,10 +350,13 @@ AimpDiscordPresence::TrackInfo AimpDiscordPresence::ReadTrackInfo() {
   Aimp::Player::Service::Player player;
   Aimp::FileManager::FileInfo fileinfo = player.GetInfo();
 
+  const std::wstring file_name =
+      fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kFileName);
   info.title = Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kTitle));
   info.artist = Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kArtist));
   info.album = Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kAlbum));
-  info.is_url = IsStreamUrl(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kFileName));
+  info.file = Utils::ToString(file_name);
+  info.is_url = IsStreamUrl(file_name);
   info.key = info.artist + "\n" + info.album + "\n" + info.title;
 
   return info;
@@ -391,13 +395,14 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   track_key_ = info.key;
   track_artist_ = info.artist;
   track_album_ = info.album;
+  track_file_ = info.file;
 
   if (request_artwork) {
     if (settings.use_albumart && settings.use_albumart_online && !info.artist.empty() &&
         !info.album.empty()) {
       // Non-blocking: the worker resolves the URL and publishes it, the next
       // notification applies it.
-      album_art_.Request(info.artist, info.album);
+      album_art_.Request(info.artist, info.album, info.file);
     } else {
       std::lock_guard<std::mutex> lock(presence_mutex_);
       artwork_key_.clear();
@@ -422,10 +427,11 @@ void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
   activity_.large_text = fields.large_text;
 
   // The local-cover layer takes priority over the online chain: a cover read
-  // from the file itself is always the right one. Both are matched by album
-  // key, which the shared builder keeps in step with ApplyPendingArtwork().
-  const std::string large_image =
-      ResolveLargeImageLocked(AlbumArt::BuildAlbumKey(info.artist, info.album), nullptr);
+  // from the file itself is always the right one. Both are matched by track
+  // identity key, which the shared builder keeps in step with
+  // ApplyPendingArtwork(); an empty album does not suppress the image.
+  const std::string large_image = ResolveLargeImageLocked(
+      AlbumArt::BuildAlbumKey(info.artist, info.album, info.file), nullptr);
   activity_.large_image = large_image;
   last_large_image_ = large_image;
 }
@@ -480,11 +486,12 @@ void AimpDiscordPresence::SetTimestamp(const TrackInfo& info) {
 }
 
 void AimpDiscordPresence::ApplyResolvedArtwork(const std::string& artist, const std::string& album,
+                                               const std::string& file_path,
                                                const std::string& url) {
   // Runs on the album art worker thread; publishing the value is all that is
   // allowed here.
   std::lock_guard<std::mutex> lock(presence_mutex_);
-  artwork_key_ = AlbumArt::BuildAlbumKey(artist, album);
+  artwork_key_ = AlbumArt::BuildAlbumKey(artist, album, file_path);
   artwork_url_ = url;
 }
 
@@ -533,7 +540,8 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
         if (hash == local_cover_sha_) {
           std::lock_guard<std::mutex> lock(presence_mutex_);
           local_cover_url_ = url;
-          local_cover_key_ = AlbumArt::BuildAlbumKey(track_artist_, track_album_);
+          local_cover_key_ =
+              AlbumArt::BuildAlbumKey(track_artist_, track_album_, track_file_);
         } else {
           LogCover("local-cover dropped hash=" + hash + " reason=stale-track");
         }
@@ -547,13 +555,13 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
   std::string applied_album;
   {
     std::lock_guard<std::mutex> lock(presence_mutex_);
-    if (track_artist_.empty() || track_album_.empty()) {
-      return false;
-    }
 
-    // The shared builder keeps this comparison in step with SetInfo(); artwork
-    // belongs to an album, not to the individual track on it.
-    const std::string album_key = AlbumArt::BuildAlbumKey(track_artist_, track_album_);
+    // The shared builder keeps this comparison in step with SetInfo(). The
+    // resolved image is applied for the track identity it was resolved for,
+    // album or not: only large_text (the caption) depends on the album tag, so
+    // an empty album must not suppress the artwork.
+    const std::string album_key =
+        AlbumArt::BuildAlbumKey(track_artist_, track_album_, track_file_);
     const std::string large_image = ResolveLargeImageLocked(album_key, &applied_source);
     if (large_image == last_large_image_) {
       return false;
@@ -573,28 +581,11 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
 
 std::string AimpDiscordPresence::ResolveLargeImageLocked(const std::string& album_key,
                                                          std::string* source) const {
-  std::string resolved;
-  if (settings.use_albumart) {
-    if (!local_cover_url_.empty() && local_cover_key_ == album_key) {
-      resolved = local_cover_url_;
-      if (source != nullptr) {
-        *source = "local";
-      }
-    } else if (!artwork_url_.empty() && artwork_key_ == album_key) {
-      resolved = artwork_url_;
-      if (source != nullptr) {
-        *source = "online";
-      }
-    }
-  }
-
-  if (resolved.empty()) {
-    if (source != nullptr) {
-      *source = "fallback";
-    }
-    return PresenceLayout::BuildLargeImage(std::string());
-  }
-  return resolved;
+  // The setting turns both sources off; the bundled asset then stays in place.
+  const std::string local_url = settings.use_albumart ? local_cover_url_ : std::string();
+  const std::string online_url = settings.use_albumart ? artwork_url_ : std::string();
+  return PresenceLayout::ResolveLargeImage(album_key, local_cover_key_, local_url,
+                                           artwork_key_, online_url, source);
 }
 
 void AimpDiscordPresence::MaybePublishLocalCover(const TrackInfo& info,
@@ -635,7 +626,7 @@ void AimpDiscordPresence::MaybePublishLocalCover(const TrackInfo& info,
     {
       std::lock_guard<std::mutex> lock(presence_mutex_);
       local_cover_url_ = known->second;
-      local_cover_key_ = AlbumArt::BuildAlbumKey(info.artist, info.album);
+      local_cover_key_ = AlbumArt::BuildAlbumKey(info.artist, info.album, info.file);
     }
     LogCover("local-cover hit hash=" + hash + " size=" + std::to_string(size) +
              " url=" + known->second);

@@ -1,18 +1,23 @@
-// Offline unit tests for src/cover_publisher.cpp.
+// Offline unit tests for src/cover_publisher.cpp and the pure album-art
+// identity helpers (src/album_art.cpp, src/presence_layout.h).
 //
-// These tests never touch the network. The implementation is compiled into
-// this translation unit, so the pure helpers (URL classification, multipart
-// assembly, boundary generation, SHA-256 cache keys, cache file handling) are
-// exercised directly.
+// These tests never touch the network. The cover_publisher implementation is
+// compiled into this translation unit, so its pure helpers (URL
+// classification, multipart assembly, boundary generation, SHA-256 cache keys,
+// cache file handling) are exercised directly; album_art.cpp is compiled as a
+// second translation unit and linked, and the presence layout is header-only.
 //
 // Build (from the repository root):
-//   cl /nologo /std:c++17 /W4 /WX /EHsc tests\cover_publisher_tests.cpp /link winhttp.lib
+//   cl /nologo /std:c++17 /W4 /WX /EHsc tests\cover_publisher_tests.cpp src\album_art.cpp /link winhttp.lib
 // Run (the optional argument names the directory for the on-disk cache test):
 //   cover_publisher_tests.exe [cache-directory]
 // The default directory is %TEMP%\cover_publisher_cache_tests. The run creates
 // and removes its own scratch file inside that directory.
 
 #include "../src/cover_publisher.cpp"
+
+#include "../src/album_art.h"
+#include "../src/presence_layout.h"
 
 #include <cstdio>
 #include <cstring>
@@ -148,6 +153,63 @@ void TestBoundary() {
     alphabet_only = alphabet_only && allowed;
   }
   Check(alphabet_only, "boundary only uses boundary-safe characters");
+}
+
+// --- Track identity keys (album vs album-less) ------------------------------
+
+void TestAlbumIdentityKeys() {
+  const std::string artist = "ZWE1HVNDXR Feat yatashigang";
+  const std::string album = "LOVELY BASTARDS";
+  const std::string file =
+      "D:\\Software\\SoulseekQt\\downloads\\complete\\ZWE1HVNDXR Feat yatashigang - LOVELY BASTARDS.flac";
+  const std::string other_file =
+      "D:\\Software\\SoulseekQt\\downloads\\complete\\ZWE1HVNDXR - untitled take.flac";
+  const std::string cover = "https://litter.catbox.moe/ofx201.jpg";
+
+  // An album tag is still the whole identity: artist + "\n" + album, with the
+  // file path never part of an albumed key.
+  const std::string album_key = AlbumArt::BuildAlbumKey(artist, album, file);
+  Check(album_key == artist + "\n" + album, "album tag -> key is artist + newline + album");
+  Check(album_key.find(file) == std::string::npos, "an albumed key never embeds the file path");
+
+  // ...and a cover resolved under that key is still adopted.
+  std::string source;
+  Check(PresenceLayout::ResolveLargeImage(album_key, album_key, cover, "", "", &source) == cover &&
+            source == "local",
+        "a resolved cover is applied for an albumed track");
+
+  // An album-less track has no album identity, but it still has an identity:
+  // the old collapsed key (artist + "\n") must not come back, because a cover
+  // resolved for it is applied even though the album tag is empty.
+  const std::string albumless_key = AlbumArt::BuildAlbumKey(artist, "", file);
+  Check(albumless_key != artist + "\n", "album-less key no longer collapses to artist + newline");
+  Check(PresenceLayout::ResolveLargeImage(albumless_key, albumless_key, cover, "", "", &source) == cover &&
+            source == "local",
+        "an empty album does not suppress the resolved cover");
+
+  // The caption is still governed by the album tag alone: only the image
+  // survives an empty album, never large_text.
+  const PresenceLayout::TextFields fields =
+      PresenceLayout::BuildTextFields(artist, "", "LOVELY BASTARDS");
+  Check(fields.large_text.empty(), "an album-less track still omits the large_text caption");
+
+  // Two album-less files by one artist are two identities, and one's cover is
+  // never adopted for the other.
+  const std::string other_key = AlbumArt::BuildAlbumKey(artist, "", other_file);
+  Check(albumless_key != other_key, "two album-less files by one artist get different keys");
+  Check(PresenceLayout::ResolveLargeImage(other_key, albumless_key, cover, "", "", &source) ==
+            PresenceLayout::kFallbackLargeImageKey,
+        "an album-less file cannot inherit another file's cover");
+
+  // An album-less key never collides with a real album's key for the same
+  // artist, in either direction, so neither can overwrite the other's cover.
+  Check(albumless_key != album_key, "album-less key never equals a real album's key");
+  Check(PresenceLayout::ResolveLargeImage(album_key, albumless_key, cover, "", "", &source) ==
+            PresenceLayout::kFallbackLargeImageKey,
+        "an album-less cover cannot overwrite a real album's stored cover");
+  Check(PresenceLayout::ResolveLargeImage(albumless_key, album_key, cover, "", "", &source) ==
+            PresenceLayout::kFallbackLargeImageKey,
+        "a real album's cover cannot be applied to an album-less file");
 }
 
 // --- SHA-256 cache keys -----------------------------------------------------
@@ -440,6 +502,7 @@ int main(int argc, char** argv) {
   TestClassifier();
   TestMultipartArithmetic();
   TestBoundary();
+  TestAlbumIdentityKeys();
   TestSha256();
   TestCompressionPlan();
   TestCompressionPreparation();

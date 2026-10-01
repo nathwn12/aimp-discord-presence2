@@ -66,11 +66,16 @@ enum class Provider {
 
 // --- Pure helpers, unit tested separately ---------------------------------
 
-// Builds the per-album identity key (artist + album) used both as the resolver
-// cache key and to match a resolved artwork URL with the track currently
-// playing. It deliberately ignores the track title: artwork is per-album, and
-// one shared builder keeps the resolver and the plugin from drifting apart.
-std::string BuildAlbumKey(const std::string& artist, const std::string& album);
+// Builds the identity key used both as the resolver cache key and to match a
+// resolved artwork URL with the track currently playing. An album tag is the
+// whole identity (artist + "\n" + album) and the track title is deliberately
+// ignored: artwork is per-album, and one shared builder keeps the resolver and
+// the plugin from drifting apart. An album-less track has no album identity, so
+// the file path captured at extraction time is appended instead
+// (artist + "\n\n" + file_path); without that discriminator every untagged file
+// by one artist would share a key and inherit another file's cover.
+std::string BuildAlbumKey(const std::string& artist, const std::string& album,
+                          const std::string& file_path);
 
 // Percent-encodes a UTF-8 string for use as a query parameter value.
 std::string UriEncodeUtf8(const std::string& utf8);
@@ -114,8 +119,11 @@ bool SearchResultMatches(const std::string& body, Provider provider,
 
 class Resolver {
  public:
+  // `file_path` is the caller's identity discriminator (see BuildAlbumKey),
+  // echoed back so the caller rebuilds the exact key it requested with.
   using Callback = std::function<void(const std::string& artist,
                                       const std::string& album,
+                                      const std::string& file_path,
                                       const std::string& url)>;
 
   Resolver();
@@ -129,12 +137,15 @@ class Resolver {
 
   void SetCallback(Callback callback);
 
-  // Queues a lookup for `artist` + `album` (UTF-8). Replaces any pending
-  // request; stale completions are dropped.
-  void Request(const std::string& artist, const std::string& album);
+  // Queues a lookup for `artist` + `album` (UTF-8). `file_path` is the opaque
+  // identity discriminator that keys the cache and is echoed to the callback.
+  // Replaces any pending request; stale completions are dropped.
+  void Request(const std::string& artist, const std::string& album,
+               const std::string& file_path);
 
   // Blocking lookup (network + cache). Exposed for the worker and tests.
-  std::string Lookup(const std::string& artist, const std::string& album);
+  std::string Lookup(const std::string& artist, const std::string& album,
+                     const std::string& file_path);
 
   void Shutdown();
 
@@ -162,6 +173,7 @@ class Resolver {
   uint64_t generation_ = 0;
   std::string request_artist_;
   std::string request_album_;
+  std::string request_file_path_;
 
   Callback callback_;
 

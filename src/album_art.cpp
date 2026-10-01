@@ -356,8 +356,14 @@ bool HttpGet(const std::string& url, std::string* body,
 
 }  // namespace
 
-std::string BuildAlbumKey(const std::string& artist, const std::string& album) {
-  return artist + "\n" + album;
+std::string BuildAlbumKey(const std::string& artist, const std::string& album,
+                          const std::string& file_path) {
+  if (!album.empty()) {
+    return artist + "\n" + album;
+  }
+  // Album-less: artist + "\n" + album alone would collapse every untagged file
+  // by one artist into a single identity, so the file path discriminates.
+  return artist + "\n\n" + file_path;
 }
 
 std::string UriEncodeUtf8(const std::string& utf8) {
@@ -702,7 +708,8 @@ void Resolver::SetCallback(Callback callback) {
   callback_ = std::move(callback);
 }
 
-void Resolver::Request(const std::string& artist, const std::string& album) {
+void Resolver::Request(const std::string& artist, const std::string& album,
+                       const std::string& file_path) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_) {
@@ -710,14 +717,16 @@ void Resolver::Request(const std::string& artist, const std::string& album) {
     }
     request_artist_ = artist;
     request_album_ = album;
+    request_file_path_ = file_path;
     has_request_ = true;
     ++generation_;
   }
   wake_.notify_all();
 }
 
-std::string Resolver::Lookup(const std::string& artist, const std::string& album) {
-  const std::string key = BuildAlbumKey(artist, album);
+std::string Resolver::Lookup(const std::string& artist, const std::string& album,
+                             const std::string& file_path) {
+  const std::string key = BuildAlbumKey(artist, album, file_path);
 
   std::string cached;
   if (TakeCached(key, &cached)) {
@@ -897,12 +906,13 @@ void Resolver::WorkerMain() {
     const bool online = online_;
     const std::string artist = request_artist_;
     const std::string album = request_album_;
+    const std::string file_path = request_file_path_;
     const Callback callback = callback_;
     lock.unlock();
 
     std::string url;
     if (online) {
-      url = Lookup(artist, album);
+      url = Lookup(artist, album, file_path);
     }
 
     lock.lock();
@@ -910,7 +920,7 @@ void Resolver::WorkerMain() {
     lock.unlock();
 
     if (!stale && callback) {
-      callback(artist, album, url);
+      callback(artist, album, file_path, url);
     }
   }
 }

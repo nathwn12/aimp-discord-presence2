@@ -86,6 +86,36 @@ inline std::string BuildLargeImage(const std::string& artwork_url) {
   return artwork_url.empty() ? std::string(kFallbackLargeImageKey) : artwork_url;
 }
 
+// The large_image for `album_key` from the resolved sources: a published local
+// cover wins over the online chain's URL, which wins over the bundled asset.
+// Each source is adopted only when its own key equals `album_key`, so a value
+// resolved for one track identity can never be shown for another. `album_key`
+// is the only identity this needs, so an album-less track resolves exactly like
+// an albumed one. `source` names the winner for the DebugLog when non-null.
+inline std::string ResolveLargeImage(const std::string& album_key,
+                                     const std::string& local_cover_key,
+                                     const std::string& local_cover_url,
+                                     const std::string& online_key,
+                                     const std::string& online_url,
+                                     std::string* source = nullptr) {
+  if (!local_cover_url.empty() && local_cover_key == album_key) {
+    if (source != nullptr) {
+      *source = "local";
+    }
+    return local_cover_url;
+  }
+  if (!online_url.empty() && online_key == album_key) {
+    if (source != nullptr) {
+      *source = "online";
+    }
+    return online_url;
+  }
+  if (source != nullptr) {
+    *source = "fallback";
+  }
+  return BuildLargeImage(std::string());
+}
+
 }  // namespace PresenceLayout
 
 #endif  // AIMPDISCORDPRESENCE_SRC_PRESENCE_LAYOUT_H_

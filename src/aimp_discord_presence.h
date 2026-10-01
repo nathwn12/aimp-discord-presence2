@@ -53,6 +53,8 @@ class AimpDiscordPresence :
     std::string title;
     std::string artist;
     std::string album;
+    // Full file path; the identity discriminator for album-less tracks.
+    std::string file;
     bool is_url = false;
   };
 
@@ -80,7 +82,7 @@ class AimpDiscordPresence :
 
   // Called on the album art worker thread: only publishes the value.
   void ApplyResolvedArtwork(const std::string& artist, const std::string& album,
-                            const std::string& url);
+                            const std::string& file_path, const std::string& url);
   // Called on AIMP's message thread: applies a newly resolved URL, local or
   // online. Returns true when the card changed and an update should be sent.
   bool ApplyPendingArtwork();
@@ -165,6 +167,8 @@ class AimpDiscordPresence :
   std::string track_key_;
   std::string track_artist_;
   std::string track_album_;
+  // Identity discriminator for album-less tracks; AIMP message thread only.
+  std::string track_file_;
   std::string last_large_image_;
   // Last track whose local cover was fingerprinted; AIMP message thread only.
   std::string local_art_key_;
