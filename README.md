@@ -12,9 +12,15 @@ title, artist, album art, an optional playback timestamp, and a small status
 badge. On your Discord profile it appears as **Listening to** the app - the same
 pattern Spotify uses.
 
-> **This is a fork.** The original plugin and its author are **Exle**:
-> <https://github.com/Exle/aimp-discord-presence>. This repository is a personal
-> fork (`aimp-discord-presence2`) that has been modernized to **v2.0.0**. The
+> **This is a fork, and the fork is the active development line.** The original
+> plugin and its author are **Exle**:
+> <https://github.com/Exle/aimp-discord-presence>. This repository
+> (`aimp-discord-presence2`) is a GitHub fork of that project and is where
+> development continues now: it is the maintained line, currently at **v2.0.0**.
+> Upstream has had no commits since **2024-06-09** (its last commit is
+> `67b5402`, *"fix: exports for win32"*) - over two years of dormancy as of
+> late 2026. It is not archived; it has simply stopped. This fork is **not** the
+> official upstream, and nothing here implies that Exle endorses it. The
 > original design, the AIMP C++ wrapper design, and the shared Discord
 > application ID all come from Exle's upstream work. This fork would not exist
 > without it.
@@ -26,6 +32,38 @@ pattern Spotify uses.
 > `lib/aimp-glue/`: a small `Aimp::` C++ façade implemented directly over the AIMP
 > SDK headers. The wrapper **design** is still Exle's; this fork only had to
 > reimplement it to keep building.
+
+## What this version adds
+
+Over the dormant upstream, this fork adds:
+
+- **A full album-art chain: local file artwork -> online lookup -> black
+  placeholder PNG.**
+  - **Local file artwork first.** AIMP's own offline artwork (embedded tags and
+    sidecar files) is published to Discord as the large image, with uploads
+    cached by image hash and adopted only after the upload proves retrievable.
+    (`src/local_art.*`, `src/cover_publisher.*`; commit `0c3e47f`.)
+  - **Keyless online lookup next.** Deezer `/search/album`, then the iTunes
+    Search API, then MusicBrainz + Cover Art Archive - no API keys, with an
+    identity match guard that rejects near-miss results. (`src/album_art.cpp`;
+    commit `9af63ff`.)
+  - **Solid black PNG last.** When nothing resolves, or online lookups are
+    disabled, the large image falls back to the black placeholder. (commit
+    `e61026e`; `src/presence_layout.h`.)
+- **A working Discord IPC handshake.** The handshake is sent as a bare opcode-0
+  payload with `v` and `client_id` at the top level; the previous
+  `cmd`/`nonce`/`args` envelope was answered with `INVALID_CLIENTID` and closed
+  before READY. Presence is now held back until READY arrives. (commit
+  `e6e2808`; `src/discord_ipc.cpp`.)
+- **Its own Discord IPC transport.** The vendored `discord-rpc` library is gone;
+  `src/discord_ipc.*` speaks Discord's local named-pipe protocol directly, with
+  opt-in `DebugLog` frame logging. (commits `ac398bf`, `86e9381`.)
+- **Artist/song/album presence lines with de-duplication** and the *Listening*
+  activity type. (`src/presence_layout.h`, `src/discord_ipc.h`; commits
+  `a2dc9d4`, `e360ab5`.)
+- **A build that survives the deleted wrapper.** With Exle's
+  `aimp-sdk-cpp-wrapper` gone, the AIMP SDK is reached through this fork's
+  in-repo `lib/aimp-glue/` façade. (commit `51b4749`.)
 
 ## Usage posture
 
