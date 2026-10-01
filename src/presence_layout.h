@@ -25,8 +25,8 @@
 
 // The Discord presence field mapping, kept in one place:
 //
-//   details    (line 2)  the artist; the track title is the fallback so the
-//                        line is never blank
+//   details    (line 2)  the artist; falls back to the album, then to the
+//                        literal "AIMP", so the line is never blank
 //   state      (line 3)  the album; empty means "omit the field entirely"
 //   large_text           the track title (the album-art tooltip); empty is
 //                        omitted
@@ -41,18 +41,22 @@ namespace PresenceLayout {
 // layer so the fallback policy does not depend on the resolver.
 constexpr const char* kFallbackLargeImageKey = "aimp";
 
+// Literal shown on line 2 when both the artist and album tags are empty.
+constexpr const char* kFallbackDetails = "AIMP";
+
 struct TextFields {
-  std::string details;     // artist, or the track title when the artist is empty
+  std::string details;     // artist, else album, else kFallbackDetails
   std::string state;       // album; empty omits the field
   std::string large_text;  // track title; empty omits the field
 };
 
-// Artist First -> Album Next -> the track title as the large-image tooltip.
+// Artist First -> Album Next -> the literal "AIMP" when both are missing.
 inline TextFields BuildTextFields(const std::string& artist,
                                   const std::string& album,
                                   const std::string& title) {
   TextFields fields;
-  fields.details = artist.empty() ? title : artist;
+  fields.details = !artist.empty() ? artist
+                                   : (!album.empty() ? album : kFallbackDetails);
   fields.state = album;
   fields.large_text = title;
   return fields;

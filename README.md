@@ -48,7 +48,8 @@ the steps below.
 - **Activity type: Listening.** Discord shows *"Listening to ..."* rather than
   *"Playing ..."*.
 - **Artist-first layout.** Line 1 is the app name, line 2 (`details`) is the
-  **artist** (the track title when the artist tag is empty), line 3 (`state`) is
+  **artist** (the album when the artist tag is empty, or `AIMP` when both the
+  artist and album tags are empty), line 3 (`state`) is
   the **album** (omitted when the album tag is empty), the **large image** is the
   **album art**, and the **track title** is the large-image tooltip (omitted when
   empty). With the default `StatusDisplayType=2` Discord renders the **artist**
