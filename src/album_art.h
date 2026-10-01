@@ -21,6 +21,7 @@
 #ifndef AIMPDISCORDPRESENCE_SRC_ALBUM_ART_H_
 #define AIMPDISCORDPRESENCE_SRC_ALBUM_ART_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -52,6 +53,12 @@ enum class Provider {
 };
 
 // --- Pure helpers, unit tested separately ---------------------------------
+
+// Builds the per-album identity key (artist + album) used both as the resolver
+// cache key and to match a resolved artwork URL with the track currently
+// playing. It deliberately ignores the track title: artwork is per-album, and
+// one shared builder keeps the resolver and the plugin from drifting apart.
+std::string BuildAlbumKey(const std::string& artist, const std::string& album);
 
 // Percent-encodes a UTF-8 string for use as a query parameter value.
 std::string UriEncodeUtf8(const std::string& utf8);
@@ -101,7 +108,8 @@ class Resolver {
 
  private:
   void WorkerMain();
-  std::string LookupUncached(const std::string& artist, const std::string& album);
+  std::string LookupUncached(const std::string& artist, const std::string& album,
+                             bool* definitive);
   bool TakeCached(const std::string& key, std::string* url);
   void StoreCached(const std::string& key, const std::string& url);
 
@@ -109,7 +117,10 @@ class Resolver {
 
   std::mutex mutex_;
   std::condition_variable wake_;
-  bool stopping_ = false;
+  // Set by Shutdown() and polled by the worker between provider requests so an
+  // in-flight resolve aborts promptly instead of running the full timeout
+  // budget while AIMP unloads.
+  std::atomic<bool> stopping_{false};
   bool online_ = true;
 
   bool has_request_ = false;

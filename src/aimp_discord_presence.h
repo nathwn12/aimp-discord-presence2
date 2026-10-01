@@ -54,6 +54,7 @@ class AimpDiscordPresence :
   void OnStreamStartSubtrack();
   void OnPlayerState(DWORD message, int param1 = NULL);
   void OnPropertyValue(DWORD message, int param1 = NULL);
+  void OnPlayerUpdatePosition();
 
  private:
   void InitializeMessageDispatcher();

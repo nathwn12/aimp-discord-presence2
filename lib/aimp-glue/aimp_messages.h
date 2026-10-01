@@ -35,6 +35,10 @@ namespace Events {
 
 const int kPlayerState = AIMP_MSG_EVENT_PLAYER_STATE;
 const int kPropertyValue = AIMP_MSG_EVENT_PROPERTY_VALUE;
+// Fires every second by timer while a track plays; unlike the position
+// property's AIMP_MSG_EVENT_PROPERTY_VALUE, which only fires when the user
+// changes the position (see apiMessages.h).
+const int kPlayerUpdatePosition = AIMP_MSG_EVENT_PLAYER_UPDATE_POSITION;
 
 namespace Stream {
 namespace Start {

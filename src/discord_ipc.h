@@ -42,6 +42,9 @@
 // worker keeps the connection alive, reconnects with a capped backoff and
 // coalesces throttled updates so the caller can never exceed Discord's limit
 // of 5 presence updates per 20 seconds.
+//
+// All pipe I/O uses overlapped operations with a bounded wait, so a stalled
+// Discord turns into a disconnect instead of blocking AIMP's message thread.
 namespace DiscordIpc {
 
 // Discord activity schema limits (characters, i.e. UTF-8 codepoints).
@@ -103,7 +106,6 @@ std::string BuildHandshakePayload(const std::string& application_id,
 std::string BuildActivityJson(const Activity& activity);
 std::string BuildSetActivityPayload(const Activity& activity, int64_t pid,
                                     const std::string& nonce, bool include_activity);
-std::string BuildClosePayload();
 
 // --- Connection ------------------------------------------------------------
 
@@ -118,10 +120,6 @@ class Client {
   // Requests a connection attempt when disconnected and reports whether the
   // pipe is currently usable. Never blocks.
   bool EnsureConnected();
-
-  // Changes the Discord application id used for the handshake. An open pipe is
-  // closed so the next connection performs a fresh handshake.
-  void SetApplicationId(const std::string& application_id);
 
   // Queues an activity update. The worker sends it as soon as the rate limit
   // window allows; rapid calls coalesce onto the latest value.
@@ -140,6 +138,10 @@ class Client {
   bool Connect();
   void Disconnect();
   bool WriteFrame(uint32_t opcode, const std::string& payload);
+  // Overlapped pipe I/O with a bounded wait; a timeout cancels the request and
+  // reports failure so the caller disconnects instead of blocking forever.
+  bool WriteAll(const char* data, size_t size);
+  bool ReadChunk(char* buffer, DWORD size, DWORD* read);
   bool PipeAlive();
   void DrainPipe();
   void SendPending(std::chrono::steady_clock::time_point now);

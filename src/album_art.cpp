@@ -218,10 +218,15 @@ class WinHttpHandle {
   HINTERNET handle_;
 };
 
-std::string HttpGet(const std::string& url) {
+// Fetches `url` and stores the response body in `body`. Returns true only when
+// a complete HTTP 200 response was received, so the caller can tell a
+// definitive provider answer (even an empty one) apart from a transport
+// failure, which must not be cached as "no artwork".
+bool HttpGet(const std::string& url, std::string* body) {
+  body->clear();
   const std::wstring wide_url = WidenUtf8(url);
   if (wide_url.empty()) {
-    return std::string();
+    return false;
   }
 
   URL_COMPONENTS components = {};
@@ -234,21 +239,21 @@ std::string HttpGet(const std::string& url) {
   components.dwUrlPathLength = static_cast<DWORD>(std::size(path));
 
   if (!WinHttpCrackUrl(wide_url.c_str(), 0, 0, &components)) {
-    return std::string();
+    return false;
   }
 
   WinHttpHandle session(WinHttpOpen(L"AIMP-Discord-Presence/2.0",
                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
   if (!session.valid()) {
-    return std::string();
+    return false;
   }
   WinHttpSetTimeouts(session.get(), kTimeoutMilliseconds, kTimeoutMilliseconds,
                      kTimeoutMilliseconds, kTimeoutMilliseconds);
 
   WinHttpHandle connection(WinHttpConnect(session.get(), host, components.nPort, 0));
   if (!connection.valid()) {
-    return std::string();
+    return false;
   }
 
   const DWORD flags = components.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
@@ -256,13 +261,13 @@ std::string HttpGet(const std::string& url) {
                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                            flags));
   if (!request.valid()) {
-    return std::string();
+    return false;
   }
 
   if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
       !WinHttpReceiveResponse(request.get(), nullptr)) {
-    return std::string();
+    return false;
   }
 
   DWORD status = 0;
@@ -272,31 +277,50 @@ std::string HttpGet(const std::string& url) {
                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
                            WINHTTP_NO_HEADER_INDEX) ||
       status != 200) {
-    return std::string();
+    return false;
   }
 
-  std::string body;
-  DWORD available = 0;
-  while (WinHttpQueryDataAvailable(request.get(), &available) && available > 0 &&
-         body.size() < kMaxResponseBytes) {
+  std::string result;
+  bool complete = false;
+  for (;;) {
+    DWORD available = 0;
+    if (!WinHttpQueryDataAvailable(request.get(), &available)) {
+      break;
+    }
+    if (available == 0) {
+      complete = true;
+      break;
+    }
+
     const DWORD chunk = (std::min)(
-        available, static_cast<DWORD>(kMaxResponseBytes - body.size()));
+        available, static_cast<DWORD>(kMaxResponseBytes - result.size()));
     std::string buffer(static_cast<size_t>(chunk), '\0');
     DWORD read = 0;
     if (!WinHttpReadData(request.get(), buffer.data(), chunk, &read) || read == 0) {
       break;
     }
-    body.append(buffer, 0, static_cast<size_t>(read));
+    result.append(buffer, 0, static_cast<size_t>(read));
+    if (result.size() >= kMaxResponseBytes) {
+      // The artwork URL always appears early in these documents; a capped
+      // response is still a usable, definitive answer.
+      complete = true;
+      break;
+    }
   }
 
-  return body;
-}
+  if (!complete) {
+    return false;
+  }
 
-std::string CacheKey(const std::string& artist, const std::string& album) {
-  return artist + "\n" + album;
+  *body = std::move(result);
+  return true;
 }
 
 }  // namespace
+
+std::string BuildAlbumKey(const std::string& artist, const std::string& album) {
+  return artist + "\n" + album;
+}
 
 std::string UriEncodeUtf8(const std::string& utf8) {
   std::string encoded;
@@ -444,15 +468,18 @@ void Resolver::Request(const std::string& artist, const std::string& album) {
 }
 
 std::string Resolver::Lookup(const std::string& artist, const std::string& album) {
-  const std::string key = CacheKey(artist, album);
+  const std::string key = BuildAlbumKey(artist, album);
 
   std::string cached;
   if (TakeCached(key, &cached)) {
     return cached;
   }
 
-  const std::string url = LookupUncached(artist, album);
-  StoreCached(key, url);
+  bool definitive = false;
+  const std::string url = LookupUncached(artist, album, &definitive);
+  if (definitive) {
+    StoreCached(key, url);
+  }
   return url;
 }
 
@@ -481,19 +508,50 @@ void Resolver::StoreCached(const std::string& key, const std::string& url) {
   }
 }
 
-std::string Resolver::LookupUncached(const std::string& artist, const std::string& album) {
+std::string Resolver::LookupUncached(const std::string& artist, const std::string& album,
+                                     bool* definitive) {
+  *definitive = false;
+
   if (artist.empty() || album.empty()) {
+    // There is nothing to query and no point in retrying later.
+    *definitive = true;
     return std::string();
   }
 
-  const std::string deezer_body = HttpGet(BuildDeezerSearchUrl(artist, album));
-  const std::string deezer_url = ExtractArtworkUrl(deezer_body, Provider::kDeezer);
-  if (!deezer_url.empty()) {
-    return deezer_url;
+  // Abort between provider requests when AIMP is unloading; failure to answer
+  // is not a definitive negative result.
+  if (stopping_.load()) {
+    return std::string();
   }
 
-  const std::string itunes_body = HttpGet(BuildItunesSearchUrl(artist, album));
-  return ExtractArtworkUrl(itunes_body, Provider::kItunes);
+  std::string deezer_body;
+  const bool deezer_answered = HttpGet(BuildDeezerSearchUrl(artist, album), &deezer_body);
+  if (deezer_answered) {
+    const std::string deezer_url = ExtractArtworkUrl(deezer_body, Provider::kDeezer);
+    if (!deezer_url.empty()) {
+      *definitive = true;
+      return deezer_url;
+    }
+  }
+
+  if (stopping_.load()) {
+    return std::string();
+  }
+
+  std::string itunes_body;
+  const bool itunes_answered = HttpGet(BuildItunesSearchUrl(artist, album), &itunes_body);
+  if (itunes_answered) {
+    const std::string itunes_url = ExtractArtworkUrl(itunes_body, Provider::kItunes);
+    if (!itunes_url.empty()) {
+      *definitive = true;
+      return itunes_url;
+    }
+  }
+
+  // Only a negative result both providers actually answered may be cached: a
+  // timeout or DNS failure must not hide the album art until cache eviction.
+  *definitive = deezer_answered && itunes_answered;
+  return std::string();
 }
 
 void Resolver::WorkerMain() {

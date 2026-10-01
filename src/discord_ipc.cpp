@@ -29,11 +29,16 @@ namespace {
 
 constexpr uint32_t kOpcodeHandshake = 0;
 constexpr uint32_t kOpcodeFrame = 1;
-constexpr uint32_t kOpcodeClose = 2;
 
 constexpr int kLivenessCheckSeconds = 10;
 constexpr DWORD kPipeReadChunk = 4096;
 constexpr size_t kMaxPipeDrainBytes = 64 * 1024;
+
+// Bounded waits for the overlapped pipe I/O. A stalled Discord must never
+// block AIMP's caller behind a write, so a timeout cancels the request and
+// the caller disconnects.
+constexpr DWORD kWriteTimeoutMilliseconds = 2000;
+constexpr DWORD kReadTimeoutMilliseconds = 1000;
 constexpr char kReplacementChar[] = "\xEF\xBF\xBD";  // U+FFFD
 
 bool IsContinuationByte(unsigned char value) { return (value & 0xC0) == 0x80; }
@@ -251,10 +256,6 @@ std::string BuildSetActivityPayload(const Activity& activity, int64_t pid,
   return payload;
 }
 
-std::string BuildClosePayload() {
-  return "{\"cmd\":\"CLOSE\",\"nonce\":\"" + EscapeJsonString(NextNonce()) + "\"}";
-}
-
 Client::Client(const std::string& application_id) : application_id_(application_id) {
   next_connect_attempt_ = std::chrono::steady_clock::now();
   worker_ = std::thread(&Client::WorkerMain, this);
@@ -274,19 +275,6 @@ bool Client::EnsureConnected() {
   }
   wake_.notify_all();
   return connected_.load();
-}
-
-void Client::SetApplicationId(const std::string& application_id) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (application_id_ == application_id) {
-      return;
-    }
-    application_id_ = application_id;
-    Disconnect();
-    next_connect_attempt_ = std::chrono::steady_clock::now();
-  }
-  wake_.notify_all();
 }
 
 bool Client::SetActivity(const Activity& activity) {
@@ -342,11 +330,8 @@ void Client::Shutdown() {
     worker_.join();
   }
 
-  if (pipe_ != INVALID_HANDLE_VALUE) {
-    WriteFrame(kOpcodeClose, BuildClosePayload());
-    CloseHandle(pipe_);
-    pipe_ = INVALID_HANDLE_VALUE;
-  }
+  // The worker's exit path runs Disconnect(), which closes the pipe; nothing
+  // is left to send or close here.
   connected_now_ = false;
   connected_.store(false);
 }
@@ -357,7 +342,7 @@ bool Client::Connect() {
   for (int index = 0; index < 10; ++index) {
     const std::wstring pipe_name = std::wstring(kPipePrefix) + std::to_wstring(index);
     const HANDLE handle = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                                      nullptr, OPEN_EXISTING, 0, nullptr);
+                                      nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
       continue;
     }
@@ -416,12 +401,71 @@ bool Client::WriteFrame(uint32_t opcode, const std::string& payload) {
   AppendUint32(frame, static_cast<uint32_t>(payload.size()));
   frame.insert(frame.end(), payload.begin(), payload.end());
 
-  DWORD written = 0;
-  const BOOL ok = WriteFile(pipe_, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr);
-  if (!ok || written != static_cast<DWORD>(frame.size())) {
+  return WriteAll(frame.data(), frame.size());
+}
+
+bool Client::WriteAll(const char* data, size_t size) {
+  if (pipe_ == INVALID_HANDLE_VALUE) {
     return false;
   }
-  return true;
+
+  // The pipe is opened with FILE_FLAG_OVERLAPPED, so every write must carry an
+  // OVERLAPPED structure. Waiting with a timeout turns a stalled Discord into
+  // a disconnect instead of a hung AIMP message thread.
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (overlapped.hEvent == nullptr) {
+    return false;
+  }
+
+  DWORD written = 0;
+  bool success = false;
+  const BOOL started = WriteFile(pipe_, data, static_cast<DWORD>(size), &written, &overlapped);
+  if (started) {
+    success = written == static_cast<DWORD>(size);
+  } else if (GetLastError() == ERROR_IO_PENDING) {
+    if (WaitForSingleObject(overlapped.hEvent, kWriteTimeoutMilliseconds) == WAIT_OBJECT_0) {
+      DWORD transferred = 0;
+      success = GetOverlappedResult(pipe_, &overlapped, &transferred, FALSE) != FALSE &&
+                transferred == static_cast<DWORD>(size);
+    } else {
+      // The wait must not outlive the OVERLAPPED it waits on.
+      CancelIoEx(pipe_, &overlapped);
+      WaitForSingleObject(overlapped.hEvent, kWriteTimeoutMilliseconds);
+    }
+  }
+
+  CloseHandle(overlapped.hEvent);
+  return success;
+}
+
+bool Client::ReadChunk(char* buffer, DWORD size, DWORD* read) {
+  if (pipe_ == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  OVERLAPPED overlapped = {};
+  overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (overlapped.hEvent == nullptr) {
+    return false;
+  }
+
+  *read = 0;
+  bool success = false;
+  const BOOL started = ReadFile(pipe_, buffer, size, read, &overlapped);
+  if (started) {
+    success = *read > 0;
+  } else if (GetLastError() == ERROR_IO_PENDING) {
+    if (WaitForSingleObject(overlapped.hEvent, kReadTimeoutMilliseconds) == WAIT_OBJECT_0) {
+      success = GetOverlappedResult(pipe_, &overlapped, read, FALSE) != FALSE && *read > 0;
+    } else {
+      CancelIoEx(pipe_, &overlapped);
+      WaitForSingleObject(overlapped.hEvent, kReadTimeoutMilliseconds);
+    }
+  }
+
+  CloseHandle(overlapped.hEvent);
+  return success;
 }
 
 bool Client::PipeAlive() {
@@ -456,7 +500,7 @@ void Client::DrainPipe() {
     const DWORD chunk = (std::min)(available, kPipeReadChunk);
     scratch.resize(chunk);
     DWORD read = 0;
-    if (!ReadFile(pipe_, scratch.data(), chunk, &read, nullptr) || read == 0) {
+    if (!ReadChunk(scratch.data(), chunk, &read)) {
       break;
     }
     drained += read;

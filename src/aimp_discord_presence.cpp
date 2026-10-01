@@ -132,6 +132,14 @@ void AimpDiscordPresence::InitializeMessageDispatcher() {
                           [&](DWORD message, int param1, void*, HRESULT*) {
                             OnPropertyValue(message, param1);
                           });
+
+  // The every-second position tick; the asynchronous artwork result needs a
+  // notification after it completes, and the seek-only property event is not
+  // one.
+  message_dispatcher.Hook(Aimp::Messages::Events::kPlayerUpdatePosition,
+                          [&](DWORD, int, void*, HRESULT*) {
+                            OnPlayerUpdatePosition();
+                          });
 }
 
 template<typename T>
@@ -213,6 +221,21 @@ void AimpDiscordPresence::OnPropertyValue(DWORD, int param1) {
   }
 }
 
+void AimpDiscordPresence::OnPlayerUpdatePosition() {
+  Aimp::Player::Service::Player player;
+  if (player.State() != kPlayerStatePlaying) {
+    return;
+  }
+
+  // The artwork lookup is asynchronous (it can take seconds), so by the time
+  // it resolves the seek-only property event may have already passed. This
+  // event fires every second while a track plays, so the late result is
+  // applied and sent promptly.
+  if (ApplyPendingArtwork()) {
+    SendActivity();
+  }
+}
+
 AimpDiscordPresence::TrackInfo AimpDiscordPresence::ReadTrackInfo() {
   TrackInfo info;
 
@@ -268,7 +291,8 @@ void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
   activity_.large_text = info.album;
 
   std::string large_image = AlbumArt::kDefaultAssetKey;
-  if (settings.use_albumart && !artwork_url_.empty() && artwork_key_ == info.key) {
+  if (settings.use_albumart && !artwork_url_.empty() &&
+      artwork_key_ == AlbumArt::BuildAlbumKey(info.artist, info.album)) {
     large_image = artwork_url_;
   }
   activity_.large_image = large_image;
@@ -329,14 +353,20 @@ void AimpDiscordPresence::ApplyResolvedArtwork(const std::string& artist, const 
   // Runs on the album art worker thread; publishing the value is all that is
   // allowed here.
   std::lock_guard<std::mutex> lock(presence_mutex_);
-  artwork_key_ = artist + "\n" + album;
+  artwork_key_ = AlbumArt::BuildAlbumKey(artist, album);
   artwork_url_ = url;
 }
 
 bool AimpDiscordPresence::ApplyPendingArtwork() {
   std::lock_guard<std::mutex> lock(presence_mutex_);
-  if (track_key_.empty() || artwork_key_ != track_key_ || artwork_url_.empty() ||
+  if (track_artist_.empty() || track_album_.empty() || artwork_url_.empty() ||
       artwork_url_ == last_large_image_) {
+    return false;
+  }
+
+  // The shared builder keeps this comparison in step with SetInfo(); artwork
+  // belongs to an album, not to the individual track on it.
+  if (artwork_key_ != AlbumArt::BuildAlbumKey(track_artist_, track_album_)) {
     return false;
   }
 
