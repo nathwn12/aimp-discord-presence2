@@ -34,6 +34,7 @@ namespace {
 // AIMP deliver the callback before IAIMPServiceAlbumArt::Get2 returns.
 struct ReceiveContext {
   LocalArt::Result result;
+  bool want_bytes = false;
 };
 
 std::string ToHex(const unsigned char* bytes, size_t size) {
@@ -132,6 +133,9 @@ void CALLBACK OnReceive(IAIMPImage* /*image*/, IAIMPImageContainer* container,
   context->result.aimp_format = aimp_format;
   context->result.format = DetectFormat(data, size, aimp_format);
   context->result.sha256_hex = sha256_hex;
+  if (context->want_bytes) {
+    context->result.bytes.assign(data, data + size);
+  }
 }
 
 }  // namespace
@@ -139,13 +143,15 @@ void CALLBACK OnReceive(IAIMPImage* /*image*/, IAIMPImageContainer* container,
 namespace LocalArt {
 
 Result Extract(IAIMPServiceAlbumArt* service,
-               IAIMPFileInfo* file_info) {
+               IAIMPFileInfo* file_info,
+               bool want_bytes) {
   Result result;
   if (service == nullptr || file_info == nullptr) {
     return result;
   }
 
   ReceiveContext context;
+  context.want_bytes = want_bytes;
   void* task_id = nullptr;
 
   // OFFLINE disables Internet providers; ORIGINAL suppresses AIMP's display

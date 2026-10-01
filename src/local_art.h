@@ -25,6 +25,7 @@
 #include <unknwn.h>
 
 #include <string>
+#include <vector>
 
 #include "apiAlbumArt.h"
 #include "apiFileManager.h"
@@ -43,13 +44,19 @@ struct Result {
   int aimp_format = AIMP_IMAGE_FORMAT_UNKNOWN;  // from Container.GetInfo
   std::string format;      // "PNG", "JPEG" or "other", sniffed from magic bytes
   std::string sha256_hex;  // lowercase hex, empty when not found
+  // Raw container bytes exactly as AIMP delivered them, at most one image.
+  // Filled only when Extract() is asked for them; never logged, printed or
+  // persisted by this module.
+  std::vector<unsigned char> bytes;
 };
 
 // Blocking, AIMP main thread only. Runs an offline-only album art request for
 // `file_info` and returns the fingerprint of the delivered container. The
 // AIMP receive callback is invoked on the calling thread before this returns,
-// so no state outlives the call. `service` stays owned by the caller.
-Result Extract(IAIMPServiceAlbumArt* service, IAIMPFileInfo* file_info);
+// so no state outlives the call. `service` stays owned by the caller. Set
+// `want_bytes` to have the result also carry the container bytes.
+Result Extract(IAIMPServiceAlbumArt* service, IAIMPFileInfo* file_info,
+               bool want_bytes = false);
 
 }  // namespace LocalArt
 

@@ -23,11 +23,14 @@
 #include <chrono>
 #include <cmath>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "aimp_core.h"
 #include "aimp_filemanager.h"
 #include "aimp_messages.h"
 #include "aimp_player.h"
+#include "cover_publisher.h"
 #include "presence_layout.h"
 #include "utils.h"
 
@@ -40,6 +43,10 @@ constexpr int kPlayerStatePlaying = 2;
 // A position difference larger than this means the user seeked and the
 // timestamp Discord is counting down locally has to be corrected.
 constexpr double kSeekDriftSeconds = 3.0;
+
+// Covers above this size are not worth a 10 second upload; they are logged and
+// skipped, and the online chain keeps the card.
+constexpr size_t kMaxCoverBytes = 8 * 1024 * 1024;
 
 int64_t UnixSecondsNow() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -65,22 +72,13 @@ bool IsAbsolutePath(const std::wstring& path) {
          (path[1] == L'\\' || path[1] == L'/');
 }
 
-// Turns the configured DebugLog value into the UTF-8 path the IPC client
-// expects. Returns an empty string when the DLL directory cannot be
-// determined, in which case logging stays off rather than writing somewhere
-// unpredictable.
-std::string ResolveDebugLogPath(const std::wstring& configured) {
-  if (configured.empty()) {
-    return std::string();
-  }
-  if (IsAbsolutePath(configured)) {
-    return Utils::ToString(configured);
-  }
-
+// Directory of the loaded plugin DLL, with a trailing separator, or an empty
+// string when it cannot be determined.
+std::string PluginDirectory() {
   HMODULE module = nullptr;
   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          reinterpret_cast<LPCSTR>(&ResolveDebugLogPath),
+                          reinterpret_cast<LPCSTR>(&PluginDirectory),
                           &module)) {
     return std::string();
   }
@@ -97,7 +95,45 @@ std::string ResolveDebugLogPath(const std::wstring& configured) {
     return std::string();
   }
 
-  return directory.substr(0, separator + 1) + Utils::ToString(configured);
+  return directory.substr(0, separator + 1);
+}
+
+// Turns the configured DebugLog value into the UTF-8 path the IPC client
+// expects. Returns an empty string when the DLL directory cannot be
+// determined, in which case logging stays off rather than writing somewhere
+// unpredictable.
+std::string ResolveDebugLogPath(const std::wstring& configured) {
+  if (configured.empty()) {
+    return std::string();
+  }
+  if (IsAbsolutePath(configured)) {
+    return Utils::ToString(configured);
+  }
+
+  const std::string directory = PluginDirectory();
+  if (directory.empty()) {
+    return std::string();
+  }
+
+  return directory + Utils::ToString(configured);
+}
+
+// The cover cache defaults to cover-cache.txt next to the DLL, so an empty
+// CoverCache still has a home. A DLL directory that cannot be determined
+// leaves the path empty, which turns the publisher's on-disk cache off rather
+// than writing somewhere unpredictable.
+std::string ResolveCoverCachePath(const std::wstring& configured) {
+  if (IsAbsolutePath(configured)) {
+    return Utils::ToString(configured);
+  }
+
+  const std::string directory = PluginDirectory();
+  if (directory.empty()) {
+    return std::string();
+  }
+
+  return directory + Utils::ToString(configured.empty() ? L"cover-cache.txt"
+                                                        : configured);
 }
 
 }  // namespace
@@ -141,6 +177,15 @@ bool AimpDiscordPresence::Load() {
     client_->SetLogPath(ResolveDebugLogPath(settings.debug_log));
   }
 
+  // Publish target for local covers: the cache is keyed by image SHA-256, so a
+  // cover is uploaded once and reused. Configuring it never touches the
+  // network; an unusable path only costs the on-disk cache.
+  CoverPublisher::Configure(ResolveCoverCachePath(settings.cover_cache));
+
+  // Single publisher worker. It owns no AIMP object, only the bytes it is
+  // handed, and it is joined in Unload().
+  cover_worker_ = std::thread(&AimpDiscordPresence::CoverWorkerMain, this);
+
   album_art_.SetCallback(
       [this](const std::string& artist, const std::string& album, const std::string& url) {
         ApplyResolvedArtwork(artist, album, url);
@@ -160,6 +205,8 @@ void AimpDiscordPresence::LoadConfig() {
   LoadConfigValue(config, L"DiscordPresence\\Timestamp", &settings.timestamp);
   LoadConfigValue(config, L"DiscordPresence\\UseAlbumArt", &settings.use_albumart);
   LoadConfigValue(config, L"DiscordPresence\\UseAlbumArtOnline", &settings.use_albumart_online);
+  LoadConfigValue(config, L"DiscordPresence\\LocalCover", &settings.local_cover);
+  LoadConfigValue(config, L"DiscordPresence\\CoverCache", &settings.cover_cache);
   LoadConfigValue(config, L"DiscordPresence\\StatusDisplayType", &settings.status_display_type);
   LoadConfigValue(config, L"DiscordPresence\\DebugLog", &settings.debug_log);
   LoadConfigValue(config, L"DiscordPresence\\State.UsePlay", &settings.status.use_play);
@@ -206,6 +253,10 @@ void AimpDiscordPresence::LoadConfigValue(Aimp::Core::Service::Config config, co
 
 bool AimpDiscordPresence::Unload() {
   Aimp::Messages::Service::MessageDispatcher().UnhookAll();
+
+  // Joins the publisher worker: it holds only queued image bytes, so it can be
+  // stopped without an AIMP object ever crossing threads.
+  StopCoverWorker();
 
   // Joins the artwork worker, so no callback can touch this plugin afterwards.
   album_art_.Shutdown();
@@ -309,6 +360,26 @@ AimpDiscordPresence::TrackInfo AimpDiscordPresence::ReadTrackInfo() {
 void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   const TrackInfo info = ReadTrackInfo();
 
+  // Local (offline) cover: extract the track's own artwork on the message
+  // thread once per new track, log its fingerprint, and either apply a URL
+  // already known for that image or hand the bytes to the publisher worker.
+  // A URL is only ever adopted when an upload proved retrievable, so the
+  // online chain's URL or the bundled asset stays in place until then. Runs
+  // before SetInfo() so a known URL lands in this same update.
+  if (request_artwork && info.key != local_art_key_) {
+    local_art_key_ = info.key;
+    // A cover queued for the previous track must not be applied to this one.
+    local_cover_sha_.clear();
+    if (!info.is_url) {
+      LocalArt::Result art =
+          ExtractLocalArt(info, settings.use_albumart && settings.local_cover);
+      if (art.found) {
+        local_cover_sha_ = art.sha256_hex;
+        MaybePublishLocalCover(info, std::move(art));
+      }
+    }
+  }
+
   {
     std::lock_guard<std::mutex> lock(presence_mutex_);
     SetInfo(info);
@@ -333,14 +404,6 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
     }
   }
 
-  // Observational only: fingerprint the local cover once per new track so the
-  // DebugLog proves the SDK hands us the file's own artwork bytes. It never
-  // touches the activity payload or the online resolver.
-  if (request_artwork && !info.is_url && info.key != local_art_key_) {
-    local_art_key_ = info.key;
-    LogLocalArt(info);
-  }
-
   SendActivity();
 }
 
@@ -357,11 +420,11 @@ void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
   activity_.state = fields.state;
   activity_.large_text = fields.large_text;
 
-  const bool art_matches =
-      settings.use_albumart && !artwork_url_.empty() &&
-      artwork_key_ == AlbumArt::BuildAlbumKey(info.artist, info.album);
+  // The local-cover layer takes priority over the online chain: a cover read
+  // from the file itself is always the right one. Both are matched by album
+  // key, which the shared builder keeps in step with ApplyPendingArtwork().
   const std::string large_image =
-      PresenceLayout::BuildLargeImage(art_matches ? artwork_url_ : std::string());
+      ResolveLargeImageLocked(AlbumArt::BuildAlbumKey(info.artist, info.album), nullptr);
   activity_.large_image = large_image;
   last_large_image_ = large_image;
 }
@@ -425,40 +488,230 @@ void AimpDiscordPresence::ApplyResolvedArtwork(const std::string& artist, const 
 }
 
 bool AimpDiscordPresence::ApplyPendingArtwork() {
-  std::string applied_url;
+  // A finished publish, if any. The URL is adopted only when the publisher
+  // proved the upload retrievable (Result.ok); a failure is logged and leaves
+  // the online chain or the bundled asset in place.
+  {
+    std::string hash;
+    bool ok = false;
+    std::string url;
+    std::string reason;
+    {
+      std::lock_guard<std::mutex> lock(cover_mutex_);
+      if (cover_result_ready_) {
+        hash = cover_result_hash_;
+        ok = cover_result_ok_;
+        url = cover_result_url_;
+        reason = cover_result_reason_;
+        cover_result_hash_.clear();
+        cover_result_url_.clear();
+        cover_result_reason_.clear();
+        cover_result_ready_ = false;
+      }
+    }
+
+    if (!hash.empty()) {
+      if (!ok) {
+        // The gate at work: no local URL is adopted, and the reason is on
+        // record. The publisher's own negative cache keeps a dead host from
+        // being retried immediately.
+        LogCover("local-cover failed hash=" + hash +
+                 " reason=" + (reason.empty() ? "unknown" : reason));
+      } else {
+        // Remember the URL even when the track has moved on, so the image is
+        // never uploaded twice in one session.
+        local_cover_urls_[hash] = url;
+        if (hash == local_cover_sha_) {
+          std::lock_guard<std::mutex> lock(presence_mutex_);
+          local_cover_url_ = url;
+          local_cover_key_ = AlbumArt::BuildAlbumKey(track_artist_, track_album_);
+        } else {
+          LogCover("local-cover dropped hash=" + hash + " reason=stale-track");
+        }
+      }
+    }
+  }
+
+  std::string applied_image;
+  std::string applied_source;
   std::string applied_artist;
   std::string applied_album;
   {
     std::lock_guard<std::mutex> lock(presence_mutex_);
-    if (track_artist_.empty() || track_album_.empty() || artwork_url_.empty() ||
-        artwork_url_ == last_large_image_) {
+    if (track_artist_.empty() || track_album_.empty()) {
       return false;
     }
 
     // The shared builder keeps this comparison in step with SetInfo(); artwork
     // belongs to an album, not to the individual track on it.
-    if (artwork_key_ != AlbumArt::BuildAlbumKey(track_artist_, track_album_)) {
+    const std::string album_key = AlbumArt::BuildAlbumKey(track_artist_, track_album_);
+    const std::string large_image = ResolveLargeImageLocked(album_key, &applied_source);
+    if (large_image == last_large_image_) {
       return false;
     }
 
-    last_large_image_ = artwork_url_;
-    activity_.large_image = artwork_url_;
-    applied_url = artwork_url_;
+    last_large_image_ = large_image;
+    activity_.large_image = large_image;
+    applied_image = large_image;
     applied_artist = track_artist_;
     applied_album = track_album_;
   }
 
-  // Observational only: records which network URL the existing chain resolved
-  // for this album, so the log shows the online and local sources side by
-  // side. The activity itself is unchanged.
-  if (client_) {
-    client_->LogLine("online-art applied artist=\"" + applied_artist + "\" album=\"" +
-                     applied_album + "\" url=" + applied_url);
-  }
+  LogCover("large-image applied artist=\"" + applied_artist + "\" album=\"" +
+           applied_album + "\" source=" + applied_source + " url=" + applied_image);
   return true;
 }
 
-void AimpDiscordPresence::LogLocalArt(const TrackInfo& info) {
+std::string AimpDiscordPresence::ResolveLargeImageLocked(const std::string& album_key,
+                                                         std::string* source) const {
+  std::string resolved;
+  if (settings.use_albumart) {
+    if (!local_cover_url_.empty() && local_cover_key_ == album_key) {
+      resolved = local_cover_url_;
+      if (source != nullptr) {
+        *source = "local";
+      }
+    } else if (!artwork_url_.empty() && artwork_key_ == album_key) {
+      resolved = artwork_url_;
+      if (source != nullptr) {
+        *source = "online";
+      }
+    }
+  }
+
+  if (resolved.empty()) {
+    if (source != nullptr) {
+      *source = "fallback";
+    }
+    return PresenceLayout::BuildLargeImage(std::string());
+  }
+  return resolved;
+}
+
+void AimpDiscordPresence::MaybePublishLocalCover(const TrackInfo& info,
+                                                 LocalArt::Result art) {
+  if (!settings.use_albumart || !settings.local_cover) {
+    return;
+  }
+  if (!art.found || art.bytes.empty() || art.sha256_hex.empty()) {
+    return;
+  }
+
+  const std::string hash = art.sha256_hex;
+  const size_t size = art.bytes.size();
+
+  // Only the container shapes the host serves back (and the publisher
+  // therefore accepts) are uploaded; anything else would spend an upload on a
+  // URL the publisher has to reject.
+  const char* mime = nullptr;
+  if (art.format == "PNG") {
+    mime = "image/png";
+  } else if (art.format == "JPEG") {
+    mime = "image/jpeg";
+  }
+  if (mime == nullptr) {
+    LogCover("local-cover skipped hash=" + hash + " format=" + art.format +
+             " reason=unsupported-format");
+    return;
+  }
+
+  if (size > kMaxCoverBytes) {
+    LogCover("local-cover skipped hash=" + hash + " size=" + std::to_string(size) +
+             " limit=" + std::to_string(kMaxCoverBytes) + " reason=too-large");
+    return;
+  }
+
+  const auto known = local_cover_urls_.find(hash);
+  if (known != local_cover_urls_.end()) {
+    {
+      std::lock_guard<std::mutex> lock(presence_mutex_);
+      local_cover_url_ = known->second;
+      local_cover_key_ = AlbumArt::BuildAlbumKey(info.artist, info.album);
+    }
+    LogCover("local-cover hit hash=" + hash + " size=" + std::to_string(size) +
+             " url=" + known->second);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(cover_mutex_);
+    if (cover_inflight_hash_ == hash ||
+        (cover_result_ready_ && cover_result_hash_ == hash)) {
+      // Already queued, running or waiting to be picked up.
+      return;
+    }
+    cover_request_hash_ = hash;
+    cover_request_mime_ = mime;
+    cover_request_bytes_ = std::move(art.bytes);
+    cover_inflight_hash_ = hash;
+    cover_has_request_ = true;
+  }
+  cover_wake_.notify_one();
+
+  LogCover("local-cover queued hash=" + hash + " size=" + std::to_string(size) +
+           " mime=" + mime);
+}
+
+void AimpDiscordPresence::CoverWorkerMain() {
+  for (;;) {
+    std::string hash;
+    std::string mime;
+    std::vector<unsigned char> bytes;
+    {
+      std::unique_lock<std::mutex> lock(cover_mutex_);
+      cover_wake_.wait(lock, [this] { return cover_stopping_ || cover_has_request_; });
+      if (cover_stopping_) {
+        return;
+      }
+      hash = std::move(cover_request_hash_);
+      mime = std::move(cover_request_mime_);
+      bytes = std::move(cover_request_bytes_);
+      cover_request_hash_.clear();
+      cover_request_mime_.clear();
+      cover_request_bytes_.clear();
+      cover_has_request_ = false;
+    }
+
+    // Blocking, but on this worker only: the message thread is never held up
+    // by the upload, which is bounded by the publisher's own budget.
+    const CoverPublisher::Result result = CoverPublisher::Publish(bytes, mime.c_str());
+    std::vector<unsigned char>().swap(bytes);
+
+    {
+      std::lock_guard<std::mutex> lock(cover_mutex_);
+      if (cover_inflight_hash_ == hash) {
+        cover_inflight_hash_.clear();
+      }
+      cover_result_hash_ = hash;
+      cover_result_ok_ = result.ok;
+      cover_result_url_ = result.url;
+      cover_result_reason_ = result.reason;
+      cover_result_ready_ = true;
+    }
+  }
+}
+
+void AimpDiscordPresence::StopCoverWorker() {
+  {
+    std::lock_guard<std::mutex> lock(cover_mutex_);
+    cover_stopping_ = true;
+  }
+  cover_wake_.notify_all();
+  if (cover_worker_.joinable()) {
+    cover_worker_.join();
+  }
+}
+
+void AimpDiscordPresence::LogCover(const std::string& line) {
+  if (client_) {
+    client_->LogLine(line);
+  }
+}
+
+LocalArt::Result AimpDiscordPresence::ExtractLocalArt(const TrackInfo& info,
+                                                      bool want_bytes) {
+  LocalArt::Result result;
+
   Aimp::Player::Service::Player player;
   const Aimp::FileManager::FileInfo file_info = player.GetInfo();
   IAIMPFileInfo* raw_info = file_info.get();
@@ -466,16 +719,16 @@ void AimpDiscordPresence::LogLocalArt(const TrackInfo& info) {
   const std::wstring file =
       file_info.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kFileName);
   if (raw_info == nullptr || file.empty()) {
-    return;
+    return result;
   }
 
   IAIMPServiceAlbumArt* service =
       Aimp::Detail::QueryService<IAIMPServiceAlbumArt>(IID_IAIMPServiceAlbumArt);
   if (service == nullptr) {
-    return;
+    return result;
   }
 
-  const LocalArt::Result art = LocalArt::Extract(service, raw_info);
+  const LocalArt::Result art = LocalArt::Extract(service, raw_info, want_bytes);
   service->Release();
 
   std::string online_url;
@@ -497,9 +750,8 @@ void AimpDiscordPresence::LogLocalArt(const TrackInfo& info) {
   line += online_url;
   line += "\"";
 
-  if (client_) {
-    client_->LogLine(line);
-  }
+  LogCover(line);
+  return art;
 }
 
 void AimpDiscordPresence::SendActivity() {

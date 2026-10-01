@@ -21,9 +21,13 @@
 #ifndef AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
 #define AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
 
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "aimp_implements.h"
 #include "aimp_plugin.h"
@@ -77,13 +81,29 @@ class AimpDiscordPresence :
   // Called on the album art worker thread: only publishes the value.
   void ApplyResolvedArtwork(const std::string& artist, const std::string& album,
                             const std::string& url);
-  // Called on AIMP's message thread: applies a newly resolved URL.
+  // Called on AIMP's message thread: applies a newly resolved URL, local or
+  // online. Returns true when the card changed and an update should be sent.
   bool ApplyPendingArtwork();
 
   // Called on AIMP's message thread for a new track: extracts the local
-  // (tags/sidecar) cover just to fingerprint it in the DebugLog. Never
-  // uploads, decodes or alters the image.
-  void LogLocalArt(const TrackInfo& info);
+  // (tags/sidecar) cover, appends its fingerprint to the DebugLog, and returns
+  // it. Never uploads, decodes or alters the image.
+  LocalArt::Result ExtractLocalArt(const TrackInfo& info, bool want_bytes);
+  // Called on AIMP's message thread with a freshly extracted cover: applies a
+  // URL already known for that image, or queues the bytes for the publisher
+  // worker. A published URL is only ever adopted when the upload proved
+  // retrievable, so a dead host cannot blank the card.
+  void MaybePublishLocalCover(const TrackInfo& info, LocalArt::Result art);
+  // Publisher worker: blocks on its own mailbox and owns no AIMP object.
+  void CoverWorkerMain();
+  void StopCoverWorker();
+  void LogCover(const std::string& line);
+
+  // Large-image value for `album_key`; must be called with presence_mutex_
+  // held. A published local cover wins over the online chain's URL, which wins
+  // over the bundled asset. `source` names the winner for the DebugLog.
+  std::string ResolveLargeImageLocked(const std::string& album_key,
+                                      std::string* source) const;
 
  private:
   void LoadConfig();
@@ -96,6 +116,14 @@ class AimpDiscordPresence :
     bool timestamp = false;
     bool use_albumart = true;
     bool use_albumart_online = true;
+    // Publishes the track's own (offline) cover for Discord to fetch.
+    // Publishing is best effort and gated on the upload proving retrievable:
+    // when it fails, the online chain's URL (or the bundled asset) stays.
+    bool local_cover = true;
+    // Optional file for the published-cover cache. Empty (the default) means
+    // cover-cache.txt next to the plugin DLL; a bare or relative name resolves
+    // there as well, an absolute path is used as given.
+    std::wstring cover_cache;
     // What the member-list status line shows: 0 = name, 1 = state (album),
     // 2 = details (artist). Defaults to 2, the artist-first layout.
     int status_display_type = 2;
@@ -120,12 +148,18 @@ class AimpDiscordPresence :
   std::unique_ptr<DiscordIpc::Client> client_;
   AlbumArt::Resolver album_art_;
 
-  // Guards activity_ and the resolved artwork state, which is touched by the
-  // album art worker thread.
+  // Guards activity_ and the artwork state, which the album art worker thread
+  // publishes into. The publisher worker never touches this state; it only
+  // fills its own guarded slot below.
   std::mutex presence_mutex_;
   DiscordIpc::Activity activity_;
   std::string artwork_key_;
   std::string artwork_url_;
+  // Published local cover, valid for one album key. Set from a publisher
+  // Result only when it reported ok, so a failure leaves the online chain (or
+  // the fallback asset) in place.
+  std::string local_cover_key_;
+  std::string local_cover_url_;
 
   // AIMP message thread only.
   std::string track_key_;
@@ -134,9 +168,36 @@ class AimpDiscordPresence :
   std::string last_large_image_;
   // Last track whose local cover was fingerprinted; AIMP message thread only.
   std::string local_art_key_;
+  // SHA-256 of the local cover of the track that is playing now; the result of
+  // an upload is applied only while it still matches. AIMP message thread only.
+  std::string local_cover_sha_;
+  // Image hash -> published URL, this session. A hit is applied synchronously;
+  // the publisher's on-disk cache is consulted on the worker, where blocking
+  // for a moment is allowed. AIMP message thread only.
+  std::unordered_map<std::string, std::string> local_cover_urls_;
   double sent_position_ = 0.0;
   int64_t sent_at_seconds_ = 0;
   bool paused_ = false;
+
+  // Publisher worker plumbing. The worker is handed bytes, a mime and a hash;
+  // it owns no AIMP object, and it writes its result into the guarded slot the
+  // position handler picks up.
+  std::thread cover_worker_;
+  std::mutex cover_mutex_;
+  std::condition_variable cover_wake_;
+  bool cover_stopping_ = false;
+  bool cover_has_request_ = false;
+  std::string cover_request_hash_;
+  std::string cover_request_mime_;
+  std::vector<unsigned char> cover_request_bytes_;
+  // Hash of the image a request is queued or running for, so a track that
+  // visits the same cover twice does not upload it twice.
+  std::string cover_inflight_hash_;
+  bool cover_result_ready_ = false;
+  bool cover_result_ok_ = false;
+  std::string cover_result_hash_;
+  std::string cover_result_url_;
+  std::string cover_result_reason_;
 };
 
 #endif  // AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
