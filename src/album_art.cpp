@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 namespace AlbumArt {
@@ -35,6 +37,12 @@ constexpr int kTimeoutMilliseconds = 1500;
 
 constexpr const char* kDeezerHost = "api.deezer.com";
 constexpr const char* kItunesHost = "itunes.apple.com";
+constexpr const char* kMusicBrainzHost = "musicbrainz.org";
+constexpr const char* kCoverArtArchiveHost = "coverartarchive.org";
+
+// MusicBrainz allows one request per second per client; the gate is set a
+// little above that so clock granularity cannot drift it below the limit.
+constexpr int kMusicBrainzIntervalMilliseconds = 1100;
 
 constexpr const char* kHexDigits = "0123456789ABCDEF";
 
@@ -221,9 +229,21 @@ class WinHttpHandle {
 // Fetches `url` and stores the response body in `body`. Returns true only when
 // a complete HTTP 200 response was received, so the caller can tell a
 // definitive provider answer (even an empty one) apart from a transport
-// failure, which must not be cached as "no artwork".
-bool HttpGet(const std::string& url, std::string* body) {
+// failure, which must not be cached as "no artwork". Redirects are followed by
+// WinHTTP's default policy (https only), which the Cover Art Archive needs: its
+// size endpoints answer 307 toward the Internet Archive copy of the image.
+//
+// `user_agent` is sent as an additional header when non-empty; `status_code`
+// receives the HTTP status code, or 0 when no response was received at all, so
+// a caller can tell a 404 from a timeout.
+bool HttpGet(const std::string& url, std::string* body,
+             const std::string& user_agent = std::string(),
+             int* status_code = nullptr) {
   body->clear();
+  if (status_code != nullptr) {
+    *status_code = 0;
+  }
+
   const std::wstring wide_url = WidenUtf8(url);
   if (wide_url.empty()) {
     return false;
@@ -264,7 +284,20 @@ bool HttpGet(const std::string& url, std::string* body) {
     return false;
   }
 
-  if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+  // A descriptive User-Agent is mandatory for MusicBrainz; the other providers
+  // use the session User-Agent.
+  std::wstring header_block;
+  if (!user_agent.empty()) {
+    header_block = L"User-Agent: ";
+    header_block += WidenUtf8(user_agent);
+    header_block += L"\r\n";
+  }
+  if (!WinHttpSendRequest(request.get(),
+                          header_block.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS
+                                               : header_block.c_str(),
+                          header_block.empty()
+                              ? 0
+                              : static_cast<DWORD>(header_block.size()),
                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
       !WinHttpReceiveResponse(request.get(), nullptr)) {
     return false;
@@ -275,8 +308,13 @@ bool HttpGet(const std::string& url, std::string* body) {
   if (!WinHttpQueryHeaders(request.get(),
                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
-                           WINHTTP_NO_HEADER_INDEX) ||
-      status != 200) {
+                           WINHTTP_NO_HEADER_INDEX)) {
+    return false;
+  }
+  if (status_code != nullptr) {
+    *status_code = static_cast<int>(status);
+  }
+  if (status != 200) {
     return false;
   }
 
@@ -388,14 +426,161 @@ std::string UpscaleItunesArtwork(const std::string& url) {
   return url.substr(0, start) + "600x600bb." + url.substr(marker + 3);
 }
 
+namespace {
+
+// Normalizes a metadata string for the identity guard: ASCII letters are
+// lowercased and every run of other characters collapses to one space.
+// Non-ASCII bytes count as separators, so a guard check can only ever reject a
+// hit; it never accepts a wrong one on a technicality.
+std::string NormalizeForMatch(const std::string& text) {
+  std::string normalized;
+  normalized.reserve(text.size());
+  bool separator_pending = false;
+
+  for (const char raw : text) {
+    const unsigned char value = static_cast<unsigned char>(raw);
+    const bool is_ascii_alnum = (value >= '0' && value <= '9') ||
+                                (value >= 'a' && value <= 'z') ||
+                                (value >= 'A' && value <= 'Z');
+    if (!is_ascii_alnum) {
+      separator_pending = !normalized.empty();
+      continue;
+    }
+    if (separator_pending) {
+      normalized.push_back(' ');
+      separator_pending = false;
+    }
+    normalized.push_back(static_cast<char>(std::tolower(value)));
+  }
+
+  return normalized;
+}
+
+std::vector<std::string> SplitWords(const std::string& normalized) {
+  std::vector<std::string> words;
+  size_t start = 0;
+  while (start < normalized.size()) {
+    const size_t end = normalized.find(' ', start);
+    if (end == std::string::npos) {
+      words.push_back(normalized.substr(start));
+      break;
+    }
+    words.push_back(normalized.substr(start, end - start));
+    start = end + 1;
+  }
+  return words;
+}
+
+// Word-prefix agreement: after normalization the shorter string's whole words
+// must match the longer string's leading words. "Discovery" matches "Discovery
+// (Deluxe Edition)" and "Live at Madison Square Garden" matches its "(Live)"
+// variant, while "Program Music I" does not match "Program Music III" because
+// the final words differ.
+bool MetadataMatches(const std::string& expected, const std::string& candidate) {
+  const std::string normalized_expected = NormalizeForMatch(expected);
+  const std::string normalized_candidate = NormalizeForMatch(candidate);
+  if (normalized_expected.empty() || normalized_candidate.empty()) {
+    return false;
+  }
+  if (normalized_expected == normalized_candidate) {
+    return true;
+  }
+
+  const std::vector<std::string> expected_words = SplitWords(normalized_expected);
+  const std::vector<std::string> candidate_words = SplitWords(normalized_candidate);
+  const std::vector<std::string>& short_words =
+      expected_words.size() <= candidate_words.size() ? expected_words : candidate_words;
+  const std::vector<std::string>& long_words =
+      expected_words.size() <= candidate_words.size() ? candidate_words : expected_words;
+
+  for (size_t index = 0; index < short_words.size(); ++index) {
+    if (short_words[index] != long_words[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Reads the first hit's artist and album out of a search response. Only the
+// response shapes of the providers that are actually queried are handled; false
+// means the response carried no usable hit identity.
+bool ExtractSearchHitIdentity(const std::string& body, Provider provider,
+                              std::string* hit_artist, std::string* hit_album) {
+  if (body.empty()) {
+    return false;
+  }
+
+  if (provider == Provider::kDeezer) {
+    // {"data":[{"title":"...","artist":{"name":"..."}},...]}
+    *hit_album = ExtractJsonStringField(body, "title");
+    const size_t artist_key = body.find("\"artist\"");
+    *hit_artist = artist_key == std::string::npos
+                      ? std::string()
+                      : ExtractJsonStringField(body.substr(artist_key), "name");
+    return !hit_artist->empty() && !hit_album->empty();
+  }
+
+  if (provider == Provider::kItunes) {
+    // {"results":[{"artistName":"...","collectionName":"..."},...]}
+    *hit_artist = ExtractJsonStringField(body, "artistName");
+    *hit_album = ExtractJsonStringField(body, "collectionName");
+    return !hit_artist->empty() && !hit_album->empty();
+  }
+
+  if (provider == Provider::kMusicBrainz) {
+    // Everything is read after the "release-groups" key: the document also
+    // nests releases[].id and artist-credit[].artist.id, so an "id" or "name"
+    // from the top of the document could belong to the wrong object.
+    const size_t anchor = body.find("\"release-groups\"");
+    if (anchor == std::string::npos) {
+      return false;
+    }
+    const std::string release_group = body.substr(anchor);
+    *hit_album = ExtractJsonStringField(release_group, "title");
+    const size_t credit = release_group.find("\"artist-credit\"");
+    *hit_artist = credit == std::string::npos
+                      ? std::string()
+                      : ExtractJsonStringField(release_group.substr(credit), "name");
+    return !hit_artist->empty() && !hit_album->empty();
+  }
+
+  return false;
+}
+
+// A strict 8-4-4-4-12 hexadecimal UUID check, so a malformed MBID cannot inject
+// a path segment into the Cover Art Archive URL.
+bool IsUuid(const std::string& value) {
+  if (value.size() != 36) {
+    return false;
+  }
+  for (size_t index = 0; index < value.size(); ++index) {
+    const bool is_separator = index == 8 || index == 13 || index == 18 || index == 23;
+    if (is_separator) {
+      if (value[index] != '-') {
+        return false;
+      }
+      continue;
+    }
+    if (HexValue(value[index]) < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 std::string BuildDeezerSearchUrl(const std::string& artist, const std::string& album) {
   // Deezer retired the `artist:"..." album:"..."` advanced syntax: it now
   // answers 200 with {"data":[],"total":0} (verified 2026-10-01). The plain
-  // free-text query returns the same album objects, including `cover_xl`.
+  // free-text query returns the same album objects, including `cover_xl`, so
+  // the album endpoint is queried with free text and the light identity guard
+  // rejects the occasional wrong first hit.
   std::string url = "https://";
   url += kDeezerHost;
-  url += "/search?q=";
+  url += "/search/album?q=";
   url += UriEncodeUtf8(artist + " " + album);
+  url += "&limit=1";
   return url;
 }
 
@@ -406,6 +591,70 @@ std::string BuildItunesSearchUrl(const std::string& artist, const std::string& a
   url += UriEncodeUtf8(artist + " " + album);
   url += "&media=music&limit=1";
   return url;
+}
+
+std::string BuildMusicBrainzReleaseGroupUrl(const std::string& artist,
+                                            const std::string& album) {
+  // WS/2 search syntax ("artist:"..." AND releasegroup:"..."). The whole Lucene
+  // query is percent-encoded, so the %22 sequences carry the phrase quotes;
+  // backslashes and quotes inside a term are escaped first so a tag cannot
+  // smuggle query syntax into the request.
+  const auto escape_term = [](const std::string& term) {
+    std::string escaped;
+    escaped.reserve(term.size());
+    for (const char current : term) {
+      if (current == '\\' || current == '"') {
+        escaped.push_back('\\');
+      }
+      escaped.push_back(current);
+    }
+    return escaped;
+  };
+
+  const std::string query = "artist:\"" + escape_term(artist) + "\" AND releasegroup:\"" +
+                            escape_term(album) + "\"";
+  std::string url = "https://";
+  url += kMusicBrainzHost;
+  url += "/ws/2/release-group/?query=";
+  url += UriEncodeUtf8(query);
+  url += "&fmt=json&limit=1";
+  return url;
+}
+
+std::string BuildCoverArtArchiveUrl(const std::string& mbid) {
+  if (!IsUuid(mbid)) {
+    return std::string();
+  }
+  // The direct size endpoint answers with the image itself (after a redirect to
+  // the Internet Archive copy), so there is no JSON body whose http:// image
+  // URLs would have to be rewritten to https://.
+  std::string url = "https://";
+  url += kCoverArtArchiveHost;
+  url += "/release-group/";
+  url += mbid;
+  url += "/front-500";
+  return url;
+}
+
+std::string ExtractMusicBrainzReleaseGroupId(const std::string& body) {
+  const size_t anchor = body.find("\"release-groups\"");
+  if (anchor == std::string::npos) {
+    return std::string();
+  }
+  // Slicing before searching is the point: release-group objects nest
+  // releases[].id and artist-credit[].artist.id values, so only the first "id"
+  // after the "release-groups" key is the release-group MBID.
+  return ExtractJsonStringField(body.substr(anchor), "id");
+}
+
+bool SearchResultMatches(const std::string& body, Provider provider,
+                         const std::string& artist, const std::string& album) {
+  std::string hit_artist;
+  std::string hit_album;
+  if (!ExtractSearchHitIdentity(body, provider, &hit_artist, &hit_album)) {
+    return false;
+  }
+  return MetadataMatches(artist, hit_artist) && MetadataMatches(album, hit_album);
 }
 
 std::string ExtractArtworkUrl(const std::string& body, Provider provider) {
@@ -519,18 +768,28 @@ std::string Resolver::LookupUncached(const std::string& artist, const std::strin
   }
 
   // Abort between provider requests when AIMP is unloading; failure to answer
-  // is not a definitive negative result.
+  // is never a definitive negative result. A provider that answered but whose
+  // hit did not survive the identity guard has still given a definitive answer:
+  // retrying the same query would not change it.
+  bool all_reached_answered = true;
+
   if (stopping_.load()) {
     return std::string();
   }
 
-  std::string deezer_body;
-  const bool deezer_answered = HttpGet(BuildDeezerSearchUrl(artist, album), &deezer_body);
-  if (deezer_answered) {
-    const std::string deezer_url = ExtractArtworkUrl(deezer_body, Provider::kDeezer);
-    if (!deezer_url.empty()) {
-      *definitive = true;
-      return deezer_url;
+  // Tier 1: Deezer album search.
+  {
+    std::string deezer_body;
+    if (HttpGet(BuildDeezerSearchUrl(artist, album), &deezer_body)) {
+      if (SearchResultMatches(deezer_body, Provider::kDeezer, artist, album)) {
+        const std::string deezer_url = ExtractArtworkUrl(deezer_body, Provider::kDeezer);
+        if (!deezer_url.empty()) {
+          *definitive = true;
+          return deezer_url;
+        }
+      }
+    } else {
+      all_reached_answered = false;
     }
   }
 
@@ -538,20 +797,91 @@ std::string Resolver::LookupUncached(const std::string& artist, const std::strin
     return std::string();
   }
 
-  std::string itunes_body;
-  const bool itunes_answered = HttpGet(BuildItunesSearchUrl(artist, album), &itunes_body);
-  if (itunes_answered) {
-    const std::string itunes_url = ExtractArtworkUrl(itunes_body, Provider::kItunes);
-    if (!itunes_url.empty()) {
-      *definitive = true;
-      return itunes_url;
+  // Tier 2: iTunes search; the artwork URL is upscaled to 600x600.
+  {
+    std::string itunes_body;
+    if (HttpGet(BuildItunesSearchUrl(artist, album), &itunes_body)) {
+      if (SearchResultMatches(itunes_body, Provider::kItunes, artist, album)) {
+        const std::string itunes_url = ExtractArtworkUrl(itunes_body, Provider::kItunes);
+        if (!itunes_url.empty()) {
+          *definitive = true;
+          return itunes_url;
+        }
+      }
+    } else {
+      all_reached_answered = false;
     }
   }
 
-  // Only a negative result both providers actually answered may be cached: a
-  // timeout or DNS failure must not hide the album art until cache eviction.
-  *definitive = deezer_answered && itunes_answered;
+  if (stopping_.load()) {
+    return std::string();
+  }
+
+  // Tier 3: MusicBrainz release-group search for an MBID, then the Cover Art
+  // Archive front cover. MusicBrainz asks for at most one request per second.
+  WaitForMusicBrainzSlot();
+  if (stopping_.load()) {
+    return std::string();
+  }
+
+  {
+    std::string musicbrainz_body;
+    if (HttpGet(BuildMusicBrainzReleaseGroupUrl(artist, album), &musicbrainz_body,
+                kUserAgent)) {
+      if (SearchResultMatches(musicbrainz_body, Provider::kMusicBrainz, artist, album)) {
+        const std::string mbid = ExtractMusicBrainzReleaseGroupId(musicbrainz_body);
+        const std::string cover_url = BuildCoverArtArchiveUrl(mbid);
+        if (!cover_url.empty()) {
+          if (stopping_.load()) {
+            return std::string();
+          }
+          // A successful GET both proves the cover exists and returns bytes
+          // that are discarded here. A 404 is a normal Cover Art Archive miss
+          // (coverage is not complete) and falls through to "no artwork"; any
+          // other failure is a transport problem, not a definitive negative.
+          std::string cover_body;
+          int cover_status = 0;
+          if (HttpGet(cover_url, &cover_body, kUserAgent, &cover_status)) {
+            *definitive = true;
+            return cover_url;
+          }
+          if (cover_status != 404) {
+            all_reached_answered = false;
+          }
+        }
+      }
+    } else {
+      all_reached_answered = false;
+    }
+  }
+
+  // Only a negative result that every reached provider actually answered may be
+  // cached: a timeout or DNS failure must not hide the album art until cache
+  // eviction.
+  *definitive = all_reached_answered;
   return std::string();
+}
+
+void Resolver::WaitForMusicBrainzSlot() {
+  const auto interval = std::chrono::milliseconds(kMusicBrainzIntervalMilliseconds);
+  for (;;) {
+    if (stopping_.load()) {
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_musicbrainz_request_);
+    if (elapsed >= interval) {
+      // Claim the slot before the request so consecutive resolves measure the
+      // interval from the previous request's start.
+      last_musicbrainz_request_ = now;
+      return;
+    }
+
+    // Sleep in short slices so an unload is not delayed by the full interval.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
 }
 
 void Resolver::WorkerMain() {

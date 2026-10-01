@@ -22,6 +22,7 @@
 #define AIMPDISCORDPRESENCE_SRC_ALBUM_ART_H_
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -31,9 +32,18 @@
 #include <thread>
 #include <unordered_map>
 
-// Resolves album art URLs from keyless public APIs (Deezer first, iTunes as a
-// fallback) on a background worker so AIMP's message thread is never blocked
-// on the network.
+// Resolves album art URLs from keyless public APIs on a background worker so
+// AIMP's message thread is never blocked on the network. The providers are
+// tried in order:
+//
+//   1. Deezer album search (`cover_xl`).
+//   2. iTunes Search API (`artworkUrl100`, upscaled to 600x600).
+//   3. MusicBrainz release-group search for an MBID, then the Cover Art Archive
+//      front cover for that MBID.
+//
+// No provider needs an API key. A hit is only accepted when a light identity
+// guard confirms the hit really is the requested artist + album, because
+// free-text search happily ranks an unrelated album first.
 //
 // The resolved URL is handed to a callback that runs on the worker thread; the
 // callback must not call AIMP services, it should only publish the value to
@@ -43,13 +53,15 @@ namespace AlbumArt {
 // Discord accepts external asset URLs up to 300 characters.
 constexpr size_t kMaxUrlLength = 300;
 
-// Public image endpoints used by Discord.
-constexpr const char* kDefaultAssetKey = "aimp";
+// MusicBrainz policy requires a descriptive User-Agent with a contact URL.
+constexpr const char* kUserAgent =
+    "AIMP-Discord-Presence/2.0.0 (https://github.com/nathwn12/aimp-discord-presence2)";
 
 enum class Provider {
   kNone = 0,
   kDeezer,
   kItunes,
+  kMusicBrainz,
 };
 
 // --- Pure helpers, unit tested separately ---------------------------------
@@ -73,10 +85,30 @@ std::string UpscaleItunesArtwork(const std::string& url);
 
 std::string BuildDeezerSearchUrl(const std::string& artist, const std::string& album);
 std::string BuildItunesSearchUrl(const std::string& artist, const std::string& album);
+// MusicBrainz WS/2 release-group search. Requested at most once per second.
+std::string BuildMusicBrainzReleaseGroupUrl(const std::string& artist,
+                                            const std::string& album);
+// Cover Art Archive cover for an MBID. Returns an empty string when `mbid` is
+// not a UUID, so a malformed search response cannot inject a path.
+std::string BuildCoverArtArchiveUrl(const std::string& mbid);
 
 // Extracts the artwork URL for a provider from a search response. Returns an
-// empty string when no usable (https, <= 300 characters) URL is present.
+// empty string when no usable (https, <= 300 characters) URL is present, and
+// for providers (MusicBrainz) whose answer is not an image URL.
 std::string ExtractArtworkUrl(const std::string& body, Provider provider);
+
+// Extracts the MBID of the first release group in a MusicBrainz WS/2 search
+// response.
+std::string ExtractMusicBrainzReleaseGroupId(const std::string& body);
+
+// Light sanity check on a free-text search response: true only when the first
+// hit's own artist and title agree with the requested pair. Agreement ignores
+// case, punctuation and whitespace, and accepts a word-prefix on either side
+// ("Discovery" matches "Discovery (Deluxe Edition)", but "Program Music I" does
+// not match "Program Music III"). A rejected hit falls through to the next
+// provider.
+bool SearchResultMatches(const std::string& body, Provider provider,
+                         const std::string& artist, const std::string& album);
 
 // --- Background resolver ---------------------------------------------------
 
@@ -110,6 +142,9 @@ class Resolver {
   void WorkerMain();
   std::string LookupUncached(const std::string& artist, const std::string& album,
                              bool* definitive);
+  // MusicBrainz allows one request per second; the worker is the only caller,
+  // so an elapsed-time gate is enough to guarantee that.
+  void WaitForMusicBrainzSlot();
   bool TakeCached(const std::string& key, std::string* url);
   void StoreCached(const std::string& key, const std::string& url);
 
@@ -132,6 +167,9 @@ class Resolver {
 
   std::unordered_map<std::string, std::string> cache_;
   std::deque<std::string> cache_order_;
+
+  // Worker thread only.
+  std::chrono::steady_clock::time_point last_musicbrainz_request_{};
 
   static constexpr size_t kMaxCacheEntries = 200;
 };
