@@ -44,9 +44,10 @@ constexpr int kPlayerStatePlaying = 2;
 // timestamp Discord is counting down locally has to be corrected.
 constexpr double kSeekDriftSeconds = 3.0;
 
-// Covers above this size are not worth a 10 second upload; they are logged and
-// skipped, and the online chain keeps the card.
-constexpr size_t kMaxCoverBytes = 8 * 1024 * 1024;
+// Input cap only: a cover above this size is skipped before the publisher sees
+// it (a pathological source is not compressed into submission). Anything that
+// passes is downscaled and re-encoded before transfer.
+constexpr size_t kMaxCoverBytes = 20 * 1024 * 1024;
 
 int64_t UnixSecondsNow() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -496,6 +497,7 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
     bool ok = false;
     std::string url;
     std::string reason;
+    std::string detail;
     {
       std::lock_guard<std::mutex> lock(cover_mutex_);
       if (cover_result_ready_) {
@@ -503,9 +505,11 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
         ok = cover_result_ok_;
         url = cover_result_url_;
         reason = cover_result_reason_;
+        detail = cover_result_detail_;
         cover_result_hash_.clear();
         cover_result_url_.clear();
         cover_result_reason_.clear();
+        cover_result_detail_.clear();
         cover_result_ready_ = false;
       }
     }
@@ -516,11 +520,16 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
         // record. The publisher's own negative cache keeps a dead host from
         // being retried immediately.
         LogCover("local-cover failed hash=" + hash +
-                 " reason=" + (reason.empty() ? "unknown" : reason));
+                 " reason=" + (reason.empty() ? "unknown" : reason) +
+                 " detail=" + (detail.empty() ? "unknown" : detail));
       } else {
         // Remember the URL even when the track has moved on, so the image is
         // never uploaded twice in one session.
         local_cover_urls_[hash] = url;
+        // Once per cover: what was prepared, what was transferred, which key
+        // the cache used. Sizes and hashes only - never bytes.
+        LogCover("local-cover published hash=" + hash + " url=" + url + " detail=" +
+                 (detail.empty() ? "unknown" : detail));
         if (hash == local_cover_sha_) {
           std::lock_guard<std::mutex> lock(presence_mutex_);
           local_cover_url_ = url;
@@ -686,6 +695,7 @@ void AimpDiscordPresence::CoverWorkerMain() {
       cover_result_ok_ = result.ok;
       cover_result_url_ = result.url;
       cover_result_reason_ = result.reason;
+      cover_result_detail_ = result.detail;
       cover_result_ready_ = true;
     }
   }

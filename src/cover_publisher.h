@@ -26,14 +26,18 @@
 
 // Anonymous cover hosting for the presence's cover art.
 //
-// Publish() uploads an image to litterbox, then proves the upload is actually
-// retrievable (a bare GET of the returned URL must answer 200 with an image/*
-// content type) before reporting success. Distinct images are uploaded once:
-// the returned URL is cached on disk, keyed by the SHA-256 of the image bytes.
-// Failures are cached briefly too, so a host outage is not hammered from the
-// player's callback.
+// Publish() prepares the image (downscale to at most 600 px on the longest side
+// and JPEG re-encode whenever that shrinks the transfer), uploads it to
+// litterbox, then proves the upload is actually retrievable (a bare GET of the
+// returned URL must answer 200 with an image/* content type) before reporting
+// success. Distinct images are uploaded once: the returned URL is cached on
+// disk, keyed by the SHA-256 of the bytes that were uploaded. A transport
+// failure is retried once after a short pause; host answers (a 412, an empty
+// body) are never retried. Failures are cached briefly too, so a host outage is
+// not hammered from the player's callback.
 //
-// Every call blocks; a publish is bounded by a ~10 second total budget. The
+// Every call blocks; each HTTP operation gets a ~20 second budget, so an upload
+// attempt plus its retry plus the health check can take longer than that. The
 // module never logs, prints, or persists image bytes - only sizes and hashes.
 // The on-disk cache is best effort: an unwritable path degrades to no cache.
 
@@ -43,6 +47,9 @@ struct Result {
   bool ok = false;
   std::string url;
   std::string reason;
+  // One-line size/dimension record for the caller's log (never image bytes),
+  // populated on every outcome including cache hits.
+  std::string detail;
 };
 
 // Names the cache file (UTF-8). An empty path disables the cache entirely.
@@ -52,8 +59,9 @@ void Configure(const std::string& cache_path);
 // Uploads image_bytes (mime names their type, e.g. "image/png") and returns the
 // public URL on success. On failure reason names the cause: "empty-body" when
 // the host answered HTTP 200 with an empty body, "http-<code>" for statuses
-// without a useful body, the response body text for 412, and short transport
-// tags ("send-failed", "health-check-failed", ...) otherwise.
+// without a useful body, the response body text for 412, and phase-tagged
+// transport failures ("receive-failed phase=receive winhttp=12002",
+// "health-check-...") otherwise.
 Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime);
 
 // Forgets every cached result and deletes the cache file (best effort).

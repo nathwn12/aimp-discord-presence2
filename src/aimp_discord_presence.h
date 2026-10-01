@@ -198,6 +198,7 @@ class AimpDiscordPresence :
   std::string cover_result_hash_;
   std::string cover_result_url_;
   std::string cover_result_reason_;
+  std::string cover_result_detail_;
 };
 
 #endif  // AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_

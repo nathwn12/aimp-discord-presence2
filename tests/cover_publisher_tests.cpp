@@ -171,6 +171,214 @@ void TestSha256() {
   Check(Sha256Hex(image_a) != Sha256Hex(image_b), "cache key differs for different bytes");
 }
 
+// --- Compression decision ---------------------------------------------------
+
+void TestCompressionPlan() {
+  const CompressionPlan large = PlanCompression(2000, 1500, 5 * 1024 * 1024);
+  Check(large.reencode, "large image is re-encoded");
+  Check(large.width == 600 && large.height == 450, "longest side clamps to 600 with aspect preserved");
+
+  const CompressionPlan portrait = PlanCompression(900, 2400, 400 * 1024);
+  Check(portrait.reencode, "portrait image is re-encoded");
+  Check(portrait.width == 225 && portrait.height == 600, "portrait long side clamps to 600");
+
+  const CompressionPlan already_small = PlanCompression(320, 240, 100 * 1024);
+  Check(!already_small.reencode, "image at or below 600 px and 256 KB skips re-encoding");
+
+  const CompressionPlan at_bound = PlanCompression(600, 600, 256 * 1024);
+  Check(!at_bound.reencode, "the 600 px / 256 KB boundary is still 'already small'");
+
+  const CompressionPlan heavy = PlanCompression(320, 240, 300 * 1024);
+  Check(heavy.reencode, "small dimensions but heavy bytes are re-encoded");
+  Check(heavy.width == 320 && heavy.height == 240, "an in-place re-encode never upscales");
+
+  const CompressionPlan just_over = PlanCompression(601, 600, 100 * 1024);
+  Check(just_over.reencode && just_over.width == 600 && just_over.height == 599,
+        "601 px on the longest side is scaled under the bound");
+
+  const CompressionPlan unknown = PlanCompression(0, 0, 1024);
+  Check(!unknown.reencode && unknown.width == 0 && unknown.height == 0, "unknown dimensions are left alone");
+}
+
+// --- Compression round trip (real WIC, still offline) -----------------------
+
+std::vector<unsigned char> EncodeTestPng(UINT width, UINT height, bool noise) {
+  std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4);
+  if (noise) {
+    uint32_t state = 0x9e3779b9u;
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+      state = state * 1664525u + 1013904223u;
+      pixels[i] = static_cast<unsigned char>(state >> 24);
+      pixels[i + 1] = static_cast<unsigned char>(state >> 16);
+      pixels[i + 2] = static_cast<unsigned char>(state >> 8);
+      pixels[i + 3] = 0xff;
+    }
+  } else {
+    for (UINT y = 0; y < height; ++y) {
+      for (UINT x = 0; x < width; ++x) {
+        const size_t i = (static_cast<size_t>(y) * width + x) * 4;
+        pixels[i] = static_cast<unsigned char>(x * 255 / width);
+        pixels[i + 1] = static_cast<unsigned char>(y * 255 / height);
+        pixels[i + 2] = 0x40;
+        pixels[i + 3] = 0xff;
+      }
+    }
+  }
+
+  std::vector<unsigned char> png;
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  {
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
+    Microsoft::WRL::ComPtr<IStream> output_stream;
+    Microsoft::WRL::ComPtr<IWICStream> wic_output;
+    Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+    Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+    Microsoft::WRL::ComPtr<IPropertyBag2> properties;
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.GetAddressOf()));
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGRA, width * 4,
+                                           static_cast<UINT>(pixels.size()), pixels.data(), &bitmap);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = CreateStreamOnHGlobal(nullptr, TRUE, output_stream.GetAddressOf());
+    }
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateStream(&wic_output);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = wic_output->InitializeFromIStream(output_stream.Get());
+    }
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = encoder->Initialize(wic_output.Get(), WICBitmapEncoderNoCache);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = encoder->CreateNewFrame(&frame, &properties);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = frame->Initialize(properties.Get());
+    }
+    if (SUCCEEDED(hr)) {
+      hr = frame->SetSize(width, height);
+    }
+    WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
+    if (SUCCEEDED(hr)) {
+      hr = frame->SetPixelFormat(&pixel_format);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = frame->WriteSource(bitmap.Get(), nullptr);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = frame->Commit();
+    }
+    if (SUCCEEDED(hr)) {
+      hr = encoder->Commit();
+    }
+
+    HGLOBAL memory = nullptr;
+    const void* data = nullptr;
+    SIZE_T size = 0;
+    if (SUCCEEDED(hr)) {
+      hr = GetHGlobalFromStream(output_stream.Get(), &memory);
+    }
+    if (SUCCEEDED(hr) && memory != nullptr) {
+      data = GlobalLock(memory);
+      size = GlobalSize(memory);
+      if (data == nullptr || size == 0) {
+        hr = E_FAIL;
+      }
+    }
+    if (SUCCEEDED(hr)) {
+      png.assign(static_cast<const unsigned char*>(data), static_cast<const unsigned char*>(data) + size);
+    }
+    if (data != nullptr) {
+      GlobalUnlock(memory);
+    }
+  }
+  if (SUCCEEDED(com)) {
+    CoUninitialize();
+  }
+  return png;
+}
+
+bool DecodeTestDimensions(const std::vector<unsigned char>& bytes, UINT* width, UINT* height) {
+  *width = 0;
+  *height = 0;
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  bool ok = false;
+  {
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    Microsoft::WRL::ComPtr<IWICStream> stream;
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.GetAddressOf()));
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateStream(&stream);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = stream->InitializeFromMemory(const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()));
+    }
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = decoder->GetFrame(0, &frame);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = frame->GetSize(width, height);
+    }
+    ok = SUCCEEDED(hr);
+  }
+  if (SUCCEEDED(com)) {
+    CoUninitialize();
+  }
+  return ok;
+}
+
+void TestCompressionPreparation() {
+  const std::vector<unsigned char> large = EncodeTestPng(1600, 1000, true);
+  Check(!large.empty(), "fixture encodes a 1600x1000 png");
+
+  const PreparedImage prepared = PrepareImageForUpload(large, "image/png");
+  Check(prepared.reencoded, "large png is re-encoded");
+  Check(prepared.mime == "image/jpeg", "re-encoded bytes are announced as jpeg");
+  Check(!prepared.bytes.empty() && prepared.bytes.size() < large.size(),
+        "re-encoded bytes are smaller than the source");
+  Check(prepared.bytes != large, "re-encoded bytes differ from the source");
+  Check(UploadCacheKey(prepared) == Sha256Hex(prepared.bytes), "cache key is the hash of the uploaded bytes");
+  Check(UploadCacheKey(prepared) != Sha256Hex(large), "cache key is not the source hash");
+  Check(prepared.note.find("input=" + std::to_string(large.size())) != std::string::npos,
+        "note records the input size");
+  Check(prepared.note.find("output=" + std::to_string(prepared.bytes.size())) != std::string::npos,
+        "note records the output size");
+  Check(prepared.note.find("mode=jpeg-q85") != std::string::npos, "note records the encode mode");
+
+  UINT width = 0;
+  UINT height = 0;
+  Check(DecodeTestDimensions(prepared.bytes, &width, &height), "re-encoded bytes decode");
+  Check(width == 600 && height == 375, "longest side is exactly 600 and aspect is preserved");
+
+  const std::vector<unsigned char> compact = EncodeTestPng(320, 240, false);
+  Check(!compact.empty() && compact.size() <= kSkipReencodeMaxBytes, "fixture is already small");
+  const PreparedImage untouched = PrepareImageForUpload(compact, "image/png");
+  Check(!untouched.reencoded, "already-small png skips re-encoding");
+  Check(untouched.bytes == compact, "original bytes pass through unchanged");
+  Check(untouched.mime == "image/png", "original mime is kept");
+  Check(UploadCacheKey(untouched) == Sha256Hex(compact), "skipped image is keyed by its original bytes");
+
+  const std::vector<unsigned char> garbage(300 * 1024, 0x5a);
+  const PreparedImage fallback = PrepareImageForUpload(garbage, "image/png");
+  Check(!fallback.reencoded, "undecodable input is not re-encoded");
+  Check(fallback.bytes == garbage, "undecodable input falls back to the original bytes");
+  Check(fallback.note.find("wic-failed=") != std::string::npos, "fallback note names the WIC failure");
+}
+
 // --- Cache hit/miss plus negative TTL --------------------------------------
 
 void TestCache(const std::wstring& directory) {
@@ -233,6 +441,8 @@ int main(int argc, char** argv) {
   TestMultipartArithmetic();
   TestBoundary();
   TestSha256();
+  TestCompressionPlan();
+  TestCompressionPreparation();
   TestCache(directory);
 
   std::printf("cover_publisher tests: %d checks, %d failures\n", g_checks, g_failures);

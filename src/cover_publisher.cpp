@@ -21,11 +21,15 @@
 #include "cover_publisher.h"
 
 #include <windows.h>
+#include <wincodec.h>
 #include <winhttp.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <map>
@@ -37,19 +41,36 @@
 
 #include "utils.h"
 
+// WIC and the COM stream plumbing it needs; declared here so the plugin and the
+// offline test binary link the same way without extra project wiring.
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+
 namespace {
 
 using CoverPublisher::Result;
 
 // --- Transport constants ----------------------------------------------------
 
-constexpr DWORD kTotalTimeoutMs = 10000;
+// Per-HTTP-operation budget. Each upload attempt and each health check gets
+// this much time; a transport failure is retried once after a short pause, so
+// an upload is bounded by two attempts plus the backoff.
+constexpr DWORD kTotalTimeoutMs = 20000;
+constexpr DWORD kRetryBackoffMs = 500;
 constexpr DWORD kMaxResponseBytes = 64 * 1024;
 constexpr size_t kMaxCacheBytes = 1024 * 1024;
 constexpr long long kNegativeCacheTtlSeconds = 60;
 // 29 bytes keep the closing delimiter ("\r\n--<boundary>--\r\n") at 37 bytes,
 // matching the live measurement of the host's request framing.
 constexpr size_t kBoundaryLength = 29;
+
+// Cover transfer shaping: the longest side is scaled down to at most 600 px and
+// the result is encoded as JPEG q85, unless the source is already both at or
+// below 600 px and at most 256 KB, in which case it goes up untouched.
+constexpr UINT kMaxImageDimension = 600;
+constexpr size_t kSkipReencodeMaxBytes = 256 * 1024;
+constexpr float kJpegQuality = 0.85f;
 
 constexpr wchar_t kAgentName[] = L"AIMP-Discord-Presence/2.0";
 constexpr wchar_t kUploadHost[] = L"litterbox.catbox.moe";
@@ -315,6 +336,217 @@ std::string Sha256Hex(const std::vector<unsigned char>& bytes) {
   }
   return hex;
 }
+
+// --- Image preparation (WIC) ------------------------------------------------
+
+// Compression is a best-effort transfer-size reduction, never a gate: any WIC
+// failure returns the original bytes untouched. The sizing decision is split
+// out as a pure function so it is testable without an encoder.
+struct CompressionPlan {
+  bool reencode = false;
+  UINT width = 0;
+  UINT height = 0;
+};
+
+CompressionPlan PlanCompression(UINT width, UINT height, size_t byte_size) {
+  CompressionPlan plan;
+  if (width == 0 || height == 0) {
+    return plan;
+  }
+  const UINT longest = width > height ? width : height;
+  if (longest <= kMaxImageDimension && byte_size <= kSkipReencodeMaxBytes) {
+    return plan;
+  }
+  plan.reencode = true;
+  if (longest <= kMaxImageDimension) {
+    plan.width = width;
+    plan.height = height;
+    return plan;
+  }
+  const double scale = static_cast<double>(kMaxImageDimension) / static_cast<double>(longest);
+  const double scaled_width = std::round(static_cast<double>(width) * scale);
+  const double scaled_height = std::round(static_cast<double>(height) * scale);
+  plan.width = static_cast<UINT>(scaled_width < 1.0 ? 1.0 : scaled_width);
+  plan.height = static_cast<UINT>(scaled_height < 1.0 ? 1.0 : scaled_height);
+  return plan;
+}
+
+struct PreparedImage {
+  std::vector<unsigned char> bytes;  // exactly what gets uploaded
+  std::string mime;                  // announces those bytes
+  std::string note;                  // one-line size/dimension record for the log
+  bool reencoded = false;
+};
+
+std::string HexHResult(HRESULT hr) {
+  char buffer[16] = {};
+  std::snprintf(buffer, sizeof(buffer), "0x%08X", static_cast<unsigned int>(hr));
+  return buffer;
+}
+
+std::string ImageNote(size_t input_bytes, size_t output_bytes, UINT source_width, UINT source_height,
+                      UINT output_width, UINT output_height, const char* mode) {
+  return "input=" + std::to_string(input_bytes) + " output=" + std::to_string(output_bytes) +
+         " dims=" + std::to_string(source_width) + "x" + std::to_string(source_height) + "->" +
+         std::to_string(output_width) + "x" + std::to_string(output_height) + " mode=" + mode;
+}
+
+PreparedImage OriginalImage(const std::vector<unsigned char>& source, const char* mime, UINT width, UINT height,
+                            const std::string& wic_error) {
+  PreparedImage prepared;
+  prepared.bytes = source;
+  prepared.mime = mime != nullptr ? std::string(mime) : std::string();
+  prepared.note = ImageNote(source.size(), source.size(), width, height, width, height, "original");
+  if (!wic_error.empty()) {
+    prepared.note += " wic-failed=" + wic_error;
+  }
+  return prepared;
+}
+
+PreparedImage PrepareImageForUpload(const std::vector<unsigned char>& source, const char* mime) {
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  const bool own_com = SUCCEEDED(com);
+  PreparedImage prepared;
+  UINT source_width = 0;
+  UINT source_height = 0;
+  std::string error;
+
+  {
+    // Nested scope so every COM object is released before CoUninitialize.
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    Microsoft::WRL::ComPtr<IWICStream> input_stream;
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.GetAddressOf()));
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateStream(&input_stream);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = input_stream->InitializeFromMemory(const_cast<BYTE*>(source.data()), static_cast<DWORD>(source.size()));
+    }
+    if (SUCCEEDED(hr)) {
+      hr = factory->CreateDecoderFromStream(input_stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = decoder->GetFrame(0, &frame);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = frame->GetSize(&source_width, &source_height);
+    }
+    if (FAILED(hr)) {
+      error = "decode:" + HexHResult(hr);
+    }
+
+    const CompressionPlan plan = PlanCompression(source_width, source_height, source.size());
+    if (error.empty() && !plan.reencode) {
+      prepared = OriginalImage(source, mime, source_width, source_height, std::string());
+    } else if (error.empty()) {
+      Microsoft::WRL::ComPtr<IWICBitmapScaler> scaler;
+      Microsoft::WRL::ComPtr<IStream> output_stream;
+      Microsoft::WRL::ComPtr<IWICStream> wic_output;
+      Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+      Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> encoder_frame;
+      Microsoft::WRL::ComPtr<IPropertyBag2> properties;
+
+      hr = factory->CreateBitmapScaler(&scaler);
+      if (SUCCEEDED(hr)) {
+        hr = scaler->Initialize(frame.Get(), plan.width, plan.height, WICBitmapInterpolationModeFant);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = CreateStreamOnHGlobal(nullptr, TRUE, output_stream.GetAddressOf());
+      }
+      if (SUCCEEDED(hr)) {
+        hr = factory->CreateStream(&wic_output);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = wic_output->InitializeFromIStream(output_stream.Get());
+      }
+      if (SUCCEEDED(hr)) {
+        hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder->Initialize(wic_output.Get(), WICBitmapEncoderNoCache);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder->CreateNewFrame(&encoder_frame, &properties);
+      }
+      if (SUCCEEDED(hr)) {
+        wchar_t quality_name[] = L"ImageQuality";
+        PROPBAG2 option = {};
+        option.pstrName = quality_name;
+        VARIANT value;
+        VariantInit(&value);
+        value.vt = VT_R4;
+        value.fltVal = kJpegQuality;
+        hr = properties->Write(1, &option, &value);
+        VariantClear(&value);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder_frame->Initialize(properties.Get());
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder_frame->SetSize(plan.width, plan.height);
+      }
+      WICPixelFormatGUID pixel_format = GUID_WICPixelFormat24bppBGR;
+      if (SUCCEEDED(hr)) {
+        hr = encoder_frame->SetPixelFormat(&pixel_format);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder_frame->WriteSource(scaler.Get(), nullptr);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder_frame->Commit();
+      }
+      if (SUCCEEDED(hr)) {
+        hr = encoder->Commit();
+      }
+
+      HGLOBAL memory = nullptr;
+      const void* data = nullptr;
+      SIZE_T size = 0;
+      if (SUCCEEDED(hr)) {
+        hr = GetHGlobalFromStream(output_stream.Get(), &memory);
+      }
+      if (SUCCEEDED(hr) && memory != nullptr) {
+        data = GlobalLock(memory);
+        size = GlobalSize(memory);
+        if (data == nullptr || size == 0) {
+          hr = E_FAIL;
+        }
+      } else if (SUCCEEDED(hr)) {
+        hr = E_FAIL;
+      }
+      if (SUCCEEDED(hr)) {
+        prepared.bytes.assign(static_cast<const unsigned char*>(data),
+                              static_cast<const unsigned char*>(data) + size);
+        prepared.mime = "image/jpeg";
+        prepared.note = ImageNote(source.size(), prepared.bytes.size(), source_width, source_height, plan.width,
+                                  plan.height, "jpeg-q85");
+        prepared.reencoded = true;
+      } else {
+        error = "encode:" + HexHResult(hr);
+      }
+      if (data != nullptr) {
+        GlobalUnlock(memory);
+      }
+    }
+  }
+
+  if (own_com) {
+    CoUninitialize();
+  }
+  if (!error.empty()) {
+    return OriginalImage(source, mime, source_width, source_height, error);
+  }
+  return prepared;
+}
+
+// The cache key is the hash of the bytes that are actually uploaded. Hashing
+// the source instead would let two different originals that compress alike
+// collide, and would hide a changed encoder behind a stale key.
+std::string UploadCacheKey(const PreparedImage& image) { return Sha256Hex(image.bytes); }
 
 // --- Cache ------------------------------------------------------------------
 
@@ -619,11 +851,16 @@ WinHttpHandle OpenSession(const Deadline& deadline) {
   return session;
 }
 
-bool QueryStatusCode(HINTERNET request, DWORD* status) {
+bool QueryStatusCode(HINTERNET request, DWORD* status, DWORD* error) {
   DWORD size = sizeof(DWORD);
   *status = 0;
-  return WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, status, &size, WINHTTP_NO_HEADER_INDEX) != FALSE;
+  *error = 0;
+  if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                          WINHTTP_HEADER_NAME_BY_INDEX, status, &size, WINHTTP_NO_HEADER_INDEX) == FALSE) {
+    *error = GetLastError();
+    return false;
+  }
+  return true;
 }
 
 bool QueryContentType(HINTERNET request, std::wstring* content_type) {
@@ -663,18 +900,32 @@ bool StartsWithImageType(const std::wstring& content_type) {
   return true;
 }
 
-bool ReadResponseBody(HINTERNET request, const Deadline& deadline, std::string* out) {
+// Names the exact failing call and carries GetLastError from it, so a body-read
+// failure is never reported as the generic "receive-failed" again.
+struct ReadOutcome {
+  bool ok = false;
+  const char* tag = "read-failed";
+  DWORD error = 0;
+};
+
+ReadOutcome ReadResponseBody(HINTERNET request, const Deadline& deadline, std::string* out) {
   out->clear();
+  ReadOutcome outcome;
   for (;;) {
     if (deadline.Expired()) {
-      return false;
+      outcome.tag = "read-timeout";
+      outcome.error = ERROR_WINHTTP_TIMEOUT;  // our own budget ran out
+      return outcome;
     }
     DWORD available = 0;
     if (WinHttpQueryDataAvailable(request, &available) == FALSE) {
-      return false;
+      outcome.tag = "data-available-failed";
+      outcome.error = GetLastError();
+      return outcome;
     }
     if (available == 0) {
-      return true;
+      outcome.ok = true;
+      return outcome;
     }
     if (available > kMaxResponseBytes) {
       available = kMaxResponseBytes;
@@ -683,54 +934,88 @@ bool ReadResponseBody(HINTERNET request, const Deadline& deadline, std::string* 
     out->resize(offset + available);
     DWORD read = 0;
     if (WinHttpReadData(request, out->data() + offset, available, &read) == FALSE) {
-      return false;
+      outcome.tag = "read-data-failed";
+      outcome.error = GetLastError();
+      return outcome;
     }
     out->resize(offset + read);
     if (read == 0 || out->size() >= kMaxResponseBytes) {
-      return true;
+      outcome.ok = true;
+      return outcome;
     }
   }
 }
 
-Result UploadMultipartBody(const std::string& body, const std::string& boundary) {
+// A failure counts as a transport failure only when it happened on the wire
+// (connect/send/receive/timeout). Host answers - a 412, an empty body, any HTTP
+// status - are real answers and are never retried.
+struct UploadAttempt {
+  Result result;
+  bool transport_failure = false;
+};
+
+std::string TransportReason(const char* tag, const char* phase, DWORD error) {
+  const char* category = error == ERROR_WINHTTP_TIMEOUT ? "timeout" : phase;
+  return std::string(tag) + " phase=" + category + " winhttp=" + std::to_string(error);
+}
+
+UploadAttempt TransportFailure(const char* tag, const char* phase, DWORD error) {
+  UploadAttempt attempt;
+  attempt.result = Failure(TransportReason(tag, phase, error));
+  attempt.transport_failure = true;
+  return attempt;
+}
+
+UploadAttempt AttemptResult(const Result& result) {
+  UploadAttempt attempt;
+  attempt.result = result;
+  return attempt;
+}
+
+UploadAttempt UploadMultipartBody(const std::string& body, const std::string& boundary) {
   if (body.size() > 0xffffffffull) {
-    return Failure("body-too-large");
+    return AttemptResult(Failure("body-too-large"));
   }
   const Deadline deadline(kTotalTimeoutMs);
   WinHttpHandle session = OpenSession(deadline);
   if (!session) {
-    return Failure("session-open-failed");
+    return TransportFailure("session-open-failed", "connect", GetLastError());
   }
   WinHttpHandle connection(WinHttpConnect(session.get(), kUploadHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
   if (!connection) {
-    return Failure("connect-failed");
+    return TransportFailure("connect-failed", "connect", GetLastError());
   }
   WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"POST", kUploadPath, nullptr, WINHTTP_NO_REFERER,
                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
   if (!request) {
-    return Failure("request-open-failed");
+    return TransportFailure("request-open-failed", "send", GetLastError());
   }
   const std::wstring headers = L"Content-Type: multipart/form-data; boundary=" + Utils::ToWString(boundary);
   const DWORD body_size = static_cast<DWORD>(body.size());
+  // totalLen == optionalLen == the exact body size, so the request carries a
+  // Content-Length and never falls back to chunked transfer encoding.
   if (WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(-1), const_cast<char*>(body.data()),
                          body_size, body_size, 0) == FALSE) {
-    return Failure("send-failed");
+    return TransportFailure("send-failed", "send", GetLastError());
   }
   if (WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
-    return Failure("receive-failed");
+    return TransportFailure("receive-failed", "receive", GetLastError());
   }
   DWORD status = 0;
-  if (!QueryStatusCode(request.get(), &status)) {
-    return Failure("status-query-failed");
+  DWORD status_error = 0;
+  if (!QueryStatusCode(request.get(), &status, &status_error)) {
+    // The host already answered; a retry would upload a second copy.
+    return AttemptResult(Failure("status-query-failed phase=receive winhttp=" + std::to_string(status_error)));
   }
   std::string response;
-  if (!ReadResponseBody(request.get(), deadline, &response)) {
+  const ReadOutcome read = ReadResponseBody(request.get(), deadline, &response);
+  if (!read.ok) {
     if (status == 200 || status == 412) {
-      return ClassifyUploadResponse(status, response);
+      return AttemptResult(ClassifyUploadResponse(status, response));
     }
-    return Failure("read-failed");
+    return TransportFailure(read.tag, "receive", read.error);
   }
-  return ClassifyUploadResponse(status, response);
+  return AttemptResult(ClassifyUploadResponse(status, response));
 }
 
 bool CrackUrl(const std::string& url, std::wstring* host, std::wstring* path) {
@@ -766,43 +1051,69 @@ bool CrackUrl(const std::string& url, std::wstring* host, std::wstring* path) {
   return true;
 }
 
+struct HealthCheck {
+  bool ok = false;
+  std::string reason;
+};
+
 // Proves the upload is actually retrievable: a bare GET (no added headers)
 // must answer 200 with an image/* content type.
-bool HealthCheckUrl(const std::string& url) {
+HealthCheck HealthCheckUrl(const std::string& url) {
+  HealthCheck check;
+  check.reason = "health-check-failed";
   const Deadline deadline(kTotalTimeoutMs);
   std::wstring host;
   std::wstring path;
   if (!CrackUrl(url, &host, &path)) {
-    return false;
+    check.reason = "health-check-crack-url-failed";
+    return check;
   }
   WinHttpHandle session = OpenSession(deadline);
   if (!session) {
-    return false;
+    check.reason = TransportReason("health-check-session-open-failed", "connect", GetLastError());
+    return check;
   }
   WinHttpHandle connection(WinHttpConnect(session.get(), host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
   if (!connection) {
-    return false;
+    check.reason = TransportReason("health-check-connect-failed", "connect", GetLastError());
+    return check;
   }
   WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
   if (!request) {
-    return false;
+    check.reason = TransportReason("health-check-request-open-failed", "send", GetLastError());
+    return check;
   }
   if (WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) == FALSE) {
-    return false;
+    check.reason = TransportReason("health-check-send-failed", "send", GetLastError());
+    return check;
   }
   if (WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
-    return false;
+    check.reason = TransportReason("health-check-receive-failed", "receive", GetLastError());
+    return check;
   }
   DWORD status = 0;
-  if (!QueryStatusCode(request.get(), &status) || status != 200) {
-    return false;
+  DWORD status_error = 0;
+  if (!QueryStatusCode(request.get(), &status, &status_error)) {
+    check.reason = "health-check-status-query-failed phase=receive winhttp=" + std::to_string(status_error);
+    return check;
+  }
+  if (status != 200) {
+    check.reason = "health-check-status=" + std::to_string(status);
+    return check;
   }
   std::wstring content_type;
   if (!QueryContentType(request.get(), &content_type)) {
-    return false;
+    check.reason = "health-check-content-type-missing";
+    return check;
   }
-  return StartsWithImageType(content_type);
+  if (!StartsWithImageType(content_type)) {
+    check.reason = "health-check-content-type=" + Utils::ToString(content_type);
+    return check;
+  }
+  check.ok = true;
+  check.reason.clear();
+  return check;
 }
 
 }  // namespace
@@ -825,20 +1136,36 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
     if (image_bytes.empty()) {
       return Failure("empty-image");
     }
-    const std::string key = Sha256Hex(image_bytes);
+    const PreparedImage prepared = PrepareImageForUpload(image_bytes, mime);
+    // The key covers exactly the bytes that go on the wire (compressed bytes
+    // when compression happened), so the cache can never answer for content the
+    // host has not actually seen.
+    const std::string key = UploadCacheKey(prepared);
     const long long now = static_cast<long long>(std::time(nullptr));
     Result cached;
     if (CacheLookup(key, now, &cached)) {
+      cached.detail = prepared.note + " key=" + key + " cache=hit";
       return cached;
     }
 
-    const std::string content_type = SanitizeMime(mime);
+    const std::string content_type = SanitizeMime(prepared.mime.c_str());
     const std::string boundary = MakeBoundary();
-    const std::string body = BuildMultipartBody(boundary, content_type, image_bytes);
-    Result result = UploadMultipartBody(body, boundary);
-    if (result.ok && !HealthCheckUrl(result.url)) {
-      result = Failure("health-check-failed");
+    const std::string body = BuildMultipartBody(boundary, content_type, prepared.bytes);
+    UploadAttempt attempt = UploadMultipartBody(body, boundary);
+    int attempts = 1;
+    if (attempt.transport_failure) {
+      Sleep(kRetryBackoffMs);
+      attempt = UploadMultipartBody(body, boundary);
+      attempts = 2;
     }
+    Result result = attempt.result;
+    if (result.ok) {
+      const HealthCheck health = HealthCheckUrl(result.url);
+      if (!health.ok) {
+        result = Failure(health.reason);
+      }
+    }
+    result.detail = prepared.note + " key=" + key + " attempts=" + std::to_string(attempts);
     CacheStore(key, result, now);
     return result;
   } catch (...) {
