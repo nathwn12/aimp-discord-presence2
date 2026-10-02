@@ -130,6 +130,29 @@ void TestClassifier() {
   Check(!uguu_empty.ok && uguu_empty.reason == "empty-body",
         "uguu 200 + empty body -> failure");
 
+  // uguu round-robins across single-label subdomains. Every one of these is a
+  // real response and must be accepted; pinning the subdomain to one letter
+  // rejected valid covers as "unexpected body" (measured live: h.uguu.se).
+  const char* const kUguuLiveUrls[] = {
+      "https://n.uguu.se/nUoxUKCo.png",
+      "https://h.uguu.se/yHYDFJRh.jpg",
+      "https://a.uguu.se/abc123.jpeg",
+      "https://z9.uguu.se/xyz789.webp",
+  };
+  for (const char* const live : kUguuLiveUrls) {
+    const Result accepted = ClassifyUploadResponse(200, live, UploadShape::kUguu);
+    Check(accepted.ok && accepted.url == live,
+          std::string("uguu subdomain accepted: ") + live);
+  }
+  // The subdomain must still be uguu's own, so a lookalike host is rejected.
+  const Result lookalike = ClassifyUploadResponse(
+      200, "https://n.uguu.se.evil.test/x.png", UploadShape::kUguu);
+  Check(!lookalike.ok && lookalike.reason == "http-200-unexpected-body",
+        "a lookalike host is still rejected");
+  const Result no_subdomain = ClassifyUploadResponse(
+      200, "https://evil.test/n.uguu.se/x.png", UploadShape::kUguu);
+  Check(!no_subdomain.ok, "a foreign host carrying the uguu path is rejected");
+
   // A WAF 403 (the measured litterbox failure) names its status and is never ok.
   const Result forbidden = ClassifyUploadResponse(403, "<html>BunkerWeb</html>");
   Check(!forbidden.ok && forbidden.reason == "http-403", "403 -> failure named by status");

@@ -126,8 +126,11 @@ constexpr const char* kUploadHostNames[kUploadHostCount] = {"litter.catbox.moe",
 // ("...moe.evil.test") or a body that is not that host's URL is rejected. The
 // success response is a bare https URL matching the host that answered; a WAF
 // or JSON error page, or HTTP 200 with an empty body, is a failure.
+// uguu round-robins across single-label subdomains (n., h., ...), so the
+// subdomain is matched generally rather than pinned to one letter - pinning it
+// rejected real responses as "unexpected body".
 constexpr char kLitterboxUrlPattern[] = R"(^https://litter\.catbox\.moe/[a-z0-9]{6}\.(png|jpg|jpeg)$)";
-constexpr char kUguuUrlPattern[] = R"(^https://(n\.)?uguu\.se/[A-Za-z0-9]+\.(png|jpg|jpeg|gif|webp|bmp)$)";
+constexpr char kUguuUrlPattern[] = R"(^https://([A-Za-z0-9-]+\.)?uguu\.se/[A-Za-z0-9]+\.(png|jpg|jpeg|gif|webp|bmp)$)";
 // Fallback when no host is specified (kept for callers that classify a bare
 // response): the strict litterbox shape.
 std::string UploadUrlPatternFor(const UploadHost& upload_host) {
