@@ -56,7 +56,13 @@ using CoverPublisher::Result;
 // Per-HTTP-operation budget. Each upload attempt and each health check gets
 // this much time; a transport failure is retried once after a short pause, so
 // an upload is bounded by two attempts plus the backoff.
-constexpr DWORD kTotalTimeoutMs = 20000;
+//
+// Sized against live measurement, not guessed: a ~30-300 KB cover uploads to
+// uguu in 0.8-4.1 s and a blocked host answers 403 immediately. The budget only
+// has to catch a HANG, and a hang is better answered by moving to the next host
+// than by waiting - the previous 20 s per host made a stalled host cost the
+// owner ~40 s of black card before the chain gave up.
+constexpr DWORD kTotalTimeoutMs = 6000;
 constexpr DWORD kRetryBackoffMs = 500;
 constexpr DWORD kMaxResponseBytes = 64 * 1024;
 constexpr size_t kMaxCacheBytes = 1024 * 1024;

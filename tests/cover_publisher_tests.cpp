@@ -224,6 +224,13 @@ void TestHostFallback() {
 // plus header choices), so the assertion pins this builder's own framing
 // instead of a probe-specific constant.
 void TestMultipartArithmetic() {
+  // The per-operation transport budget must stay small enough that a hung host
+  // costs the card seconds, not tens of seconds. Measured: a real upload takes
+  // 0.8-4.1 s, so anything above ~10 s is a stall the owner would see as black.
+  Check(kTotalTimeoutMs <= 10000,
+        "the per-operation transport budget is bounded so a hung host cannot stall the chain");
+  Check(kTotalTimeoutMs >= 4000,
+        "the transport budget still clears the slowest measured upload (4.1 s)");
   const std::vector<unsigned char> image(4321, 0x7f);
   const std::string boundary = MakeBoundary();
   const std::string prefix = MultipartPrefix(boundary, "image/png", UploadShape::kLitterbox);
