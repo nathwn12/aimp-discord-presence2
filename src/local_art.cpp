@@ -22,7 +22,9 @@
 
 #include <bcrypt.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cwctype>
 
 // SHA-256 comes from CNG; linking it here keeps the extraction leg
 // self-contained.
@@ -138,14 +140,143 @@ void CALLBACK OnReceive(IAIMPImage* /*image*/, IAIMPImageContainer* container,
   }
 }
 
+std::wstring LowerAscii(const std::wstring& text) {
+  std::wstring lowered = text;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+  return lowered;
+}
+
+// Priority of a candidate cover base name; -1 means "not a conventional cover".
+// The prefix rule accepts Windows Media Player's AlbumArtSmall / AlbumArt_{GUID}
+// names without admitting an unrelated name that merely starts with "albumart".
+int SidecarPriority(const std::wstring& lower_base) {
+  static const wchar_t* const kCoverBases[] = {L"cover", L"folder", L"front",
+                                               L"album", L"albumart"};
+  constexpr int kCoverBaseCount = 5;
+
+  // Exact convention bases, in priority order.
+  for (int i = 0; i < kCoverBaseCount; ++i) {
+    if (lower_base == kCoverBases[i]) {
+      return i;
+    }
+  }
+
+  const std::wstring kPrefix = L"albumart";
+  if (lower_base.size() > kPrefix.size() &&
+      lower_base.compare(0, kPrefix.size(), kPrefix) == 0) {
+    return kCoverBaseCount;
+  }
+  return -1;
+}
+
+bool IsImageExtension(const std::wstring& lower_extension) {
+  return lower_extension == L"jpg" || lower_extension == L"jpeg" ||
+         lower_extension == L"png" || lower_extension == L"bmp";
+}
+
 }  // namespace
 
 namespace LocalArt {
 
+std::wstring PickBestSidecarName(const std::vector<std::wstring>& names) {
+  std::wstring best;
+  int best_priority = -1;
+
+  for (const std::wstring& name : names) {
+    const std::wstring lower = LowerAscii(name);
+    // The base is everything before the last dot; a name without a dot has no
+    // extension and cannot match.
+    const size_t dot = lower.find_last_of(L'.');
+    if (dot == std::wstring::npos || dot + 1 >= lower.size()) {
+      continue;
+    }
+    const std::wstring base = lower.substr(0, dot);
+    const std::wstring extension = lower.substr(dot + 1);
+    if (!IsImageExtension(extension)) {
+      continue;
+    }
+
+    const int priority = SidecarPriority(base);
+    if (priority < 0) {
+      continue;
+    }
+    if (best_priority < 0 || priority < best_priority ||
+        (priority == best_priority && lower < LowerAscii(best))) {
+      best = name;
+      best_priority = priority;
+    }
+  }
+  return best;
+}
+
+std::wstring FindSidecarName(const std::wstring& directory) {
+  if (directory.empty()) {
+    return std::wstring();
+  }
+
+  std::wstring pattern = directory;
+  if (pattern.back() != L'\\' && pattern.back() != L'/') {
+    pattern += L'\\';
+  }
+  pattern += L'*';
+
+  WIN32_FIND_DATAW data = {};
+  HANDLE handle = FindFirstFileW(pattern.c_str(), &data);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return std::wstring();
+  }
+
+  std::vector<std::wstring> names;
+  do {
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+      names.push_back(data.cFileName);
+    }
+  } while (FindNextFileW(handle, &data) != FALSE);
+
+  FindClose(handle);
+  return PickBestSidecarName(names);
+}
+
+std::wstring FindSidecarArt(const std::wstring& track_path) {
+  if (track_path.empty()) {
+    return std::wstring();
+  }
+
+  // Start at the track's own folder. The track path is a file path, so drop the
+  // last component; a path that names a directory instead still starts there.
+  std::wstring directory = track_path;
+  const size_t last_separator = directory.find_last_of(L"\\/");
+  const bool names_a_file = last_separator != std::wstring::npos &&
+                            last_separator + 1 < directory.size() &&
+                            directory.find_last_of(L'.') > last_separator;
+  if (names_a_file) {
+    directory.erase(last_separator);
+  }
+
+  for (int level = 0; level <= kMaxSidecarLevels; ++level) {
+    if (directory.empty()) {
+      break;
+    }
+    const std::wstring name = FindSidecarName(directory);
+    if (!name.empty()) {
+      return directory + L"\\" + name;
+    }
+
+    // Ascend one level: drop the trailing component. Stop when no separator
+    // remains, which is a bare drive like "E:" - never the drive root listing.
+    const size_t separator = directory.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+      break;
+    }
+    directory.erase(separator);
+  }
+  return std::wstring();
+}
+
 Result Extract(IAIMPServiceAlbumArt* service,
                IAIMPFileInfo* file_info,
-               bool want_bytes) {
-  Result result;
+               bool want_bytes) {  Result result;
   if (service == nullptr || file_info == nullptr) {
     return result;
   }
@@ -168,6 +299,41 @@ Result Extract(IAIMPServiceAlbumArt* service,
     return result;
   }
   return context.result;
+}
+
+Result LoadSidecarBytes(const std::wstring& path) {
+  Result result;
+  if (path.empty()) {
+    return result;
+  }
+
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return result;
+  }
+
+  LARGE_INTEGER length = {};
+  if (GetFileSizeEx(file, &length) && length.QuadPart > 0 &&
+      length.QuadPart <= 0x7FFFFFFF) {
+    const DWORD size = static_cast<DWORD>(length.QuadPart);
+    std::vector<unsigned char> bytes(size);
+    DWORD read = 0;
+    if (ReadFile(file, bytes.data(), size, &read, nullptr) != FALSE && read == size) {
+      std::string sha256_hex;
+      if (Sha256(bytes.data(), size, &sha256_hex)) {
+        result.found = true;
+        result.size = size;
+        result.aimp_format = AIMP_IMAGE_FORMAT_UNKNOWN;
+        result.format = DetectFormat(bytes.data(), size, result.aimp_format);
+        result.sha256_hex = sha256_hex;
+        result.bytes = std::move(bytes);
+      }
+    }
+  }
+
+  CloseHandle(file);
+  return result;
 }
 
 }  // namespace LocalArt

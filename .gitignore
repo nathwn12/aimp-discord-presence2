@@ -1,2 +1,10 @@
 /build*/
 /output/
+
+# Compiler/linker output from ad-hoc test builds; never tracked.
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib

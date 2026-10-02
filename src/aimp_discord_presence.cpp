@@ -746,19 +746,44 @@ LocalArt::Result AimpDiscordPresence::ExtractLocalArt(const TrackInfo& info,
 
   std::string line = "local-art track=\"" + info.artist + " - " + info.title +
                      "\" album=\"" + info.album + "\" file=\"" + Utils::ToString(file) + "\"";
+  LocalArt::Result sidecar_art;
   if (art.found) {
-    line += " found=1 size=" + std::to_string(art.size) + " sha256=" + art.sha256_hex +
+    line += " found=1 source=sdk size=" + std::to_string(art.size) + " sha256=" + art.sha256_hex +
             " format=" + art.format + " aimp_format=" + std::to_string(art.aimp_format) +
             " dims=" + std::to_string(art.width) + "x" + std::to_string(art.height);
+    line += " provider=offline-only flags=WAITFOR|OFFLINE|ORIGINAL|NOCACHE";
   } else {
-    line += " found=0";
+    // AIMP's own offline providers found nothing (the multi-disc case: the art
+    // lives in an ancestor folder). Fall back to a conventional sidecar file,
+    // then hand its bytes down the exact same path the SDK result would take
+    // (same size cap, same format gate, same publish).
+    const std::wstring sidecar = LocalArt::FindSidecarArt(file);
+    if (!sidecar.empty() && want_bytes) {
+      sidecar_art = LocalArt::LoadSidecarBytes(sidecar);
+    }
+
+    line += " found=" + std::to_string(sidecar_art.found ? 1 : 0);
+    if (sidecar_art.found) {
+      line += " source=sidecar path=\"" + Utils::ToString(sidecar) + "\"";
+      line += " size=" + std::to_string(sidecar_art.size) + " sha256=" + sidecar_art.sha256_hex +
+              " format=" + sidecar_art.format +
+              " aimp_format=" + std::to_string(sidecar_art.aimp_format) +
+              " dims=" + std::to_string(sidecar_art.width) + "x" +
+              std::to_string(sidecar_art.height);
+    } else {
+      line += " source=sdk";
+      if (!sidecar.empty()) {
+        line += " sidecar_path=\"" + Utils::ToString(sidecar) + "\" sidecar_found=0";
+      }
+    }
+    line += " provider=offline-only flags=WAITFOR|OFFLINE|ORIGINAL|NOCACHE";
   }
-  line += " provider=offline-only flags=WAITFOR|OFFLINE|ORIGINAL|NOCACHE online_url=\"";
+  line += " online_url=\"";
   line += online_url;
   line += "\"";
 
   LogCover(line);
-  return art;
+  return art.found ? art : sidecar_art;
 }
 
 void AimpDiscordPresence::SendActivity() {

@@ -16,7 +16,13 @@ The plugin looks for cover art in three steps, and stops at the first one that
 works:
 
 1. **The artwork in your file.** Embedded tags and sidecar images come first, so
-   the cover you already have is the cover Discord shows.
+   the cover you already have is the cover Discord shows. AIMP's own providers
+   are asked first; if they find nothing, the plugin looks for a conventional
+   cover file (`cover`, `folder`, `front`, `album`, `albumart`, or Windows Media
+   Player's `AlbumArtSmall`/`AlbumArt_{GUID}_Large`) in the track's folder and
+   up to four folders above it, so a multi-disc album whose art sits at the
+   album level still shows its cover. Cover files are read, never decoded or
+   rewritten.
 2. **A keyless online lookup.** If the file has no artwork, the plugin asks a few
    public music services for the cover. No accounts and no API keys are
    involved, and you can turn this step off in the config.

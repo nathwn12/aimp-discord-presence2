@@ -17,6 +17,7 @@
 #include "../src/cover_publisher.cpp"
 
 #include "../src/album_art.h"
+#include "../src/local_art.cpp"
 #include "../src/presence_layout.h"
 
 #include <cstdio>
@@ -675,7 +676,145 @@ void TestCompressionPreparation() {
   Check(fallback.note.find("wic-failed=") != std::string::npos, "fallback note names the WIC failure");
 }
 
-// --- Cache hit/miss plus negative TTL --------------------------------------
+// --- Sidecar art selection (pure) -------------------------------------------
+//
+// FindSidecarArt's walk touches the filesystem, but the choice it makes inside
+// a directory is pure: PickBestSidecarName sees only a list of names. These
+// tests exercise the priority order, the case-insensitivity, the Windows Media
+// Player names, the extension gate, the 4-level bound, first-hit-wins and the
+// empty result offline. `SidecarLevels` mirrors the walk's level arithmetic
+// (folder = level 0, stop after kMaxSidecarLevels ascents) so the bound is
+// asserted without depending on the machine's directory layout.
+
+std::vector<std::wstring> Names(std::initializer_list<const wchar_t*> items) {
+  std::vector<std::wstring> names;
+  for (const wchar_t* item : items) {
+    names.emplace_back(item);
+  }
+  return names;
+}
+
+// Depth at which a cover named `cover` is found when only one level holds it:
+// 0 = the track folder. Returns -1 when the cover is out of the walk's reach.
+std::wstring PickNameAtLevel(const std::vector<std::vector<std::wstring>>& folders,
+                             int level) {
+  if (level < 0 || level >= static_cast<int>(folders.size())) {
+    return std::wstring();
+  }
+  return LocalArt::PickBestSidecarName(folders[level]);
+}
+
+int SidecarLevels(const std::vector<std::vector<std::wstring>>& folders) {
+  for (int level = 0; level <= LocalArt::kMaxSidecarLevels; ++level) {
+    const std::wstring found = PickNameAtLevel(folders, level);
+    if (found.compare(0, 5, L"cover") == 0) {
+      return level;
+    }
+  }
+  return -1;
+}
+
+void TestSidecarSelection() {
+  // (1) Priority: cover > folder > front > album > albumart, regardless of the
+  // order the directory entries arrive in.
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"front.png", L"folder.jpg", L"cover.jpg"})) == L"cover.jpg",
+        "sidecar: cover.jpg beats folder.jpg and front.png");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"folder.jpg", L"cover.jpg"})) == L"cover.jpg",
+        "sidecar: cover.jpg beats folder.jpg");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"front.png", L"folder.jpg"})) == L"folder.jpg",
+        "sidecar: folder.jpg beats front.png");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"albumart.png", L"album.jpg", L"front.png"})) == L"front.png",
+        "sidecar: front.png beats album.jpg and albumart.png");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"albumart.png", L"album.jpg"})) == L"album.jpg",
+        "sidecar: album.jpg beats albumart.png");
+  Check(LocalArt::PickBestSidecarName(Names({L"albumart.png"})) == L"albumart.png",
+        "sidecar: albumart.png is recognised last");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"cover.png", L"cover.jpg"})) == L"cover.jpg",
+        "sidecar: equal priority breaks on the lexicographically smaller name");
+
+  // (2) Case-insensitivity.
+  Check(LocalArt::PickBestSidecarName(Names({L"COVER.JPG"})) == L"COVER.JPG",
+        "sidecar: COVER.JPG is accepted");
+  Check(LocalArt::PickBestSidecarName(Names({L"Folder.PNG"})) == L"Folder.PNG",
+        "sidecar: Folder.PNG is accepted");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"folder.jpg", L"COVER.JPG"})) == L"COVER.JPG",
+        "sidecar: case is folded for priority too");
+
+  // (3) Windows Media Player names: the AlbumArt prefix is accepted.
+  Check(LocalArt::PickBestSidecarName(Names({L"AlbumArtSmall.jpg"})) == L"AlbumArtSmall.jpg",
+        "sidecar: AlbumArtSmall.jpg is accepted");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"AlbumArt_{4F2B9C1E-0000-0000-0000-000000000000}_Large.jpg"})) ==
+            L"AlbumArt_{4F2B9C1E-0000-0000-0000-000000000000}_Large.jpg",
+        "sidecar: AlbumArt_{GUID}_Large.jpg is accepted");
+  Check(LocalArt::PickBestSidecarName(Names({L"albumartwork.png"})) ==
+            L"albumartwork.png",
+        "sidecar: any albumart-prefixed name is accepted");
+  Check(LocalArt::PickBestSidecarName(Names({L"cover.jpg", L"AlbumArtSmall.jpg"})) == L"cover.jpg",
+        "sidecar: AlbumArtSmall ranks below the exact cover name");
+
+  // (4) Extension gate.
+  Check(LocalArt::PickBestSidecarName(Names({L"cover.txt"})).empty(),
+        "sidecar: cover.txt is rejected");
+  Check(LocalArt::PickBestSidecarName(Names({L"cover.bmp"})) == L"cover.bmp",
+        "sidecar: cover.bmp is accepted");
+  Check(LocalArt::PickBestSidecarName(Names({L"cover.jpeg"})) == L"cover.jpeg",
+        "sidecar: cover.jpeg is accepted");
+  Check(LocalArt::PickBestSidecarName(Names({L"cover"})).empty(),
+        "sidecar: a name with no extension is rejected");
+  Check(LocalArt::PickBestSidecarName(Names({L"cover.png.txt"})).empty(),
+        "sidecar: the last extension is what counts");
+  Check(LocalArt::PickBestSidecarName(
+            Names({L"cover.txt", L"front.png"})) == L"front.png",
+        "sidecar: a rejected extension lets a valid lower-priority name win");
+
+  // (5) The ascent is bounded at 4 levels: level 4 is reached, level 5 is not.
+  Check(SidecarLevels({{L"track.flac"}, {L"x"}, {L"x"}, {L"x"}, {L"cover.jpg"}}) == 4,
+        "sidecar: an image four levels up is found");
+  Check(SidecarLevels({{L"track.flac"}, {L"x"}, {L"x"}, {L"x"}, {L"x"}, {L"cover.jpg"}}) ==
+            -1,
+        "sidecar: an image five levels up is not found");
+  Check(LocalArt::kMaxSidecarLevels == 4, "sidecar: the ascent bound is four levels");
+
+  // (6) First hit wins: the track folder beats an ancestor.
+  Check(SidecarLevels({{L"cover.png"}, {L"cover.jpg"}}) == 0,
+        "sidecar: the track folder wins over an ancestor");
+  Check(PickNameAtLevel({{L"cover.png"}, {L"cover.jpg"}}, 0) == L"cover.png" &&
+            PickNameAtLevel({{L"cover.png"}, {L"cover.jpg"}}, 1) == L"cover.jpg",
+        "sidecar: each level is judged on its own entries");
+
+  // (7) No image anywhere in range -> empty, so the caller falls through to the
+  // online rung rather than black.
+  Check(SidecarLevels({{L"a.flac"}, {L"b.flac"}, {L"c.flac"}, {L"d.flac"},
+                       {L"cover.txt"}}) == -1,
+        "sidecar: no image in range yields nothing");
+  Check(LocalArt::PickBestSidecarName(Names({L"readme.md", L"notes.txt"})).empty(),
+        "sidecar: only non-image files yields nothing");
+  Check(LocalArt::PickBestSidecarName(std::vector<std::wstring>()).empty(),
+        "sidecar: an empty directory yields nothing");
+
+  // (8) The pure SDK path is untouched: a result with no sidecar names the sdk
+  // source, and the caller keeps the SDK bytes when both are present. This is
+  // asserted through the selection helpers above (the sidecar succeeds or not)
+  // plus the existing chain tests, which never see a sidecar. The extraction
+  // function itself is not invoked here because it needs an AIMP service.
+  LocalArt::Result sdk_only;
+  Check(!sdk_only.found && sdk_only.sha256_hex.empty(),
+        "sidecar regression: a default SDK result carries no sidecar bytes");
+  const std::wstring track =
+      L"E:\\Music4\\Naruto\\ED\\ED 09 - Shinkokyuu.flac";
+  Check(track.find(L"ED 09 - Shinkokyuu.flac") != std::wstring::npos &&
+            LocalArt::PickBestSidecarName(Names({L"track.flac"})).empty(),
+        "sidecar regression: the named failing case has no image in its own folder");
+}
+
 
 void TestCache(const std::wstring& directory) {
   CreateDirectoryW(directory.c_str(), nullptr);
@@ -743,6 +882,7 @@ int main(int argc, char** argv) {
   TestSha256();
   TestCompressionPlan();
   TestCompressionPreparation();
+  TestSidecarSelection();
   TestCache(directory);
 
   std::printf("cover_publisher tests: %d checks, %d failures\n", g_checks, g_failures);

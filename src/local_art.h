@@ -58,6 +58,43 @@ struct Result {
 Result Extract(IAIMPServiceAlbumArt* service, IAIMPFileInfo* file_info,
                bool want_bytes = false);
 
+// Read the image bytes of a sidecar file found by FindSidecarArt, sniffed with
+// the same magic-byte/extension logic the SDK result uses, and gate them by the
+// same cap. The bytes are never decoded; `local_art.cpp` does not own the cap,
+// so the caller applies it after this returns. `path` is a full path.
+Result LoadSidecarBytes(const std::wstring& path);
+
+// Deepest number of ancestor levels above the track's own folder that the
+// sidecar scan will enter. The track folder itself is level 0.
+constexpr int kMaxSidecarLevels = 4;
+
+// One directory offered to the pure sidecar chooser: the directory path plus
+// its entries' file names (directories included; the extension gate filters
+// them out). `SubdirectoryNames` populates the latter for the filesystem walk,
+// while tests build the list by hand so selection stays offline and pure.
+struct SidecarDir {
+  std::wstring path;
+  std::vector<std::wstring> names;
+};
+
+// Pure selection: pick the best conventional cover file in one directory, or an
+// empty string when the directory has none. Recognised base names, best first,
+// are `cover`, `folder`, `front`, `album`, `albumart`, plus any `albumart*`
+// prefix (Windows Media Player's `AlbumArtSmall.jpg`, `AlbumArt_{GUID}_Large.jpg`).
+// A name's base is everything before the LAST dot, so only names ending in a
+// recognised extension can win. Matching is case-insensitive; on equal priority
+// the lexicographically smaller name wins so the choice is deterministic.
+std::wstring PickBestSidecarName(const std::vector<std::wstring>& names);
+
+// Thin filesystem wrapper: reads `directory`'s entries and delegates to
+// PickBestSidecarName. Read-only; never decodes, writes or touches audio.
+std::wstring FindSidecarName(const std::wstring& directory);
+
+// Walk from the track's own folder up through its ancestors, newest level
+// first, stopping after kMaxSidecarLevels ascent steps. Returns the first
+// conventional cover file found, or an empty string when none is in range.
+std::wstring FindSidecarArt(const std::wstring& track_path);
+
 }  // namespace LocalArt
 
 #endif  // AIMPDISCORDPRESENCE_SRC_LOCAL_ART_H_
