@@ -73,12 +73,67 @@ constexpr size_t kSkipReencodeMaxBytes = 256 * 1024;
 constexpr float kJpegQuality = 0.85f;
 
 constexpr wchar_t kAgentName[] = L"AIMP-Discord-Presence/2.0";
-constexpr wchar_t kUploadHost[] = L"litterbox.catbox.moe";
-constexpr wchar_t kUploadPath[] = L"/resources/internals/api.php";
 
-// The host answers a request it cannot parse with HTTP 200 and an empty body,
-// so this exact URL shape is the only trustworthy success response.
-constexpr char kUploadUrlPattern[] = R"(^https://litter\.catbox\.moe/[a-z0-9]{6}\.(png|jpg|jpeg)$)";
+// Upload hosts are tried in order until one returns a usable URL, so a host
+// that is down or blocked for this network (litterbox now answers HTTP 403 to a
+// BunkerWeb WAF) no longer costs the cover. litterbox stays first because it
+// may work again on other networks/regions; uguu.se is the keyless fallback
+// measured working (POST /upload?output=text with a `files[]` field, responding
+// with the bare URL as text). Each host owns both its endpoint and the shape of
+// the multipart body it accepts.
+enum class UploadShape {
+  // litterbox: POST /resources/internals/api.php with reqtype=fileupload,
+  // time=72h and the image in `fileToUpload`.
+  kLitterbox,
+  // uguu: POST /upload?output=text with no extra fields and the image in
+  // `files[]`. The response body is the bare URL as text.
+  kUguu,
+};
+
+struct UploadHost {
+  const wchar_t* name;   // log marker, e.g. "litter.catbox.moe"
+  const wchar_t* host;   // for WinHttpConnect
+  const wchar_t* path;   // request target, query string included
+  UploadShape shape;
+};
+
+// The log marker as UTF-8, so it can be concatenated into a std::string line.
+std::string HostNameUtf8(const UploadHost& upload_host) {
+  if (upload_host.name == nullptr) {
+    return std::string();
+  }
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, upload_host.name, -1, nullptr, 0, nullptr,
+                                         nullptr);
+  if (needed <= 1) {
+    return std::string();
+  }
+  std::string out(static_cast<size_t>(needed - 1), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, upload_host.name, -1, out.data(), needed, nullptr, nullptr);
+  return out;
+}
+
+constexpr size_t kUploadHostCount = 2;
+constexpr UploadHost kUploadHosts[kUploadHostCount] = {
+    {L"litter.catbox.moe", L"litterbox.catbox.moe", L"/resources/internals/api.php", UploadShape::kLitterbox},
+    {L"uguu.se", L"uguu.se", L"/upload?output=text", UploadShape::kUguu},
+};
+
+// The log markers as narrow strings, index-parallel to kUploadHosts, so a
+// caller can name a host without a UTF-8 conversion at each use.
+constexpr const char* kUploadHostNames[kUploadHostCount] = {"litter.catbox.moe", "uguu.se"};
+
+// Each host owns the exact URL shape it answers with, so a lookalike host
+// ("...moe.evil.test") or a body that is not that host's URL is rejected. The
+// success response is a bare https URL matching the host that answered; a WAF
+// or JSON error page, or HTTP 200 with an empty body, is a failure.
+constexpr char kLitterboxUrlPattern[] = R"(^https://litter\.catbox\.moe/[a-z0-9]{6}\.(png|jpg|jpeg)$)";
+constexpr char kUguuUrlPattern[] = R"(^https://(n\.)?uguu\.se/[A-Za-z0-9]+\.(png|jpg|jpeg|gif|webp|bmp)$)";
+// Fallback when no host is specified (kept for callers that classify a bare
+// response): the strict litterbox shape.
+std::string UploadUrlPatternFor(const UploadHost& upload_host) {
+  return upload_host.shape == UploadShape::kUguu ? std::string(kUguuUrlPattern)
+                                                 : std::string(kLitterboxUrlPattern);
+}
 constexpr char kMimePattern[] = R"(^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$)";
 
 Result Failure(const std::string& reason) {
@@ -97,9 +152,26 @@ std::string TrimWhitespace(const std::string& text) {
   return text.substr(begin, end - begin + 1);
 }
 
+// A URL is accepted only when it matches one configured host's exact shape. The
+// strictness per host is what keeps a lookalike host, an HTML page or a JSON
+// blob from ever being adopted as a cover.
 bool LooksLikeUploadUrl(const std::string& text) {
-  static const std::regex pattern(kUploadUrlPattern);
-  return std::regex_match(text, pattern);
+  static const std::regex litterbox_pattern(kLitterboxUrlPattern);
+  static const std::regex uguu_pattern(kUguuUrlPattern);
+  return std::regex_match(text, litterbox_pattern) || std::regex_match(text, uguu_pattern);
+}
+
+// The per-host predicate used by the classifier: a 200 is a success only when
+// the body is the bare URL of the host that answered.
+bool LooksLikeHostUrl(const std::string& text, const UploadHost& upload_host) {
+  const char* url_pattern =
+      upload_host.shape == UploadShape::kUguu ? kUguuUrlPattern : kLitterboxUrlPattern;
+  static const std::map<std::string, std::regex> patterns = {
+      {kLitterboxUrlPattern, std::regex(kLitterboxUrlPattern)},
+      {kUguuUrlPattern, std::regex(kUguuUrlPattern)},
+  };
+  const auto found = patterns.find(url_pattern);
+  return found != patterns.end() && std::regex_match(text, found->second);
 }
 
 std::string SanitizeMime(const char* mime) {
@@ -132,17 +204,25 @@ const char* FilenameForMime(const std::string& mime) {
 
 // --- Multipart body ---------------------------------------------------------
 
-std::string MultipartPrefix(const std::string& boundary, const std::string& mime) {
+std::string MultipartPrefix(const std::string& boundary, const std::string& mime,
+                            UploadShape shape) {
   const std::string delimiter = "--" + boundary + "\r\n";
   std::string prefix;
-  prefix += delimiter;
-  prefix += "Content-Disposition: form-data; name=\"reqtype\"\r\n\r\n";
-  prefix += "fileupload\r\n";
-  prefix += delimiter;
-  prefix += "Content-Disposition: form-data; name=\"time\"\r\n\r\n";
-  prefix += "72h\r\n";
-  prefix += delimiter;
-  prefix += "Content-Disposition: form-data; name=\"fileToUpload\"; filename=\"";
+  if (shape == UploadShape::kLitterbox) {
+    // Three parts: reqtype, time, then the file in `fileToUpload`.
+    prefix += delimiter;
+    prefix += "Content-Disposition: form-data; name=\"reqtype\"\r\n\r\n";
+    prefix += "fileupload\r\n";
+    prefix += delimiter;
+    prefix += "Content-Disposition: form-data; name=\"time\"\r\n\r\n";
+    prefix += "72h\r\n";
+    prefix += delimiter;
+    prefix += "Content-Disposition: form-data; name=\"fileToUpload\"; filename=\"";
+  } else {
+    // One part only, in `files[]`, with no extra fields.
+    prefix += delimiter;
+    prefix += "Content-Disposition: form-data; name=\"files[]\"; filename=\"";
+  }
   prefix += FilenameForMime(mime);
   prefix += "\"\r\nContent-Type: ";
   prefix += mime;
@@ -155,8 +235,9 @@ std::string MultipartSuffix(const std::string& boundary) {
 }
 
 std::string BuildMultipartBody(const std::string& boundary, const std::string& mime,
-                               const std::vector<unsigned char>& image) {
-  std::string body = MultipartPrefix(boundary, mime);
+                               const std::vector<unsigned char>& image,
+                               UploadShape shape = UploadShape::kLitterbox) {
+  std::string body = MultipartPrefix(boundary, mime, shape);
   if (!image.empty()) {
     body.append(reinterpret_cast<const char*>(image.data()), image.size());
   }
@@ -179,13 +260,17 @@ std::string MakeBoundary() {
 
 // --- Response classification ------------------------------------------------
 
-Result ClassifyUploadResponse(DWORD status, const std::string& body) {
+// `shape` names the host that answered, so the 200 body must be that host's own
+// bare URL. The default is litterbox, which keeps the strict two-argument form
+// (and its callers) clamped to the original host.
+Result ClassifyUploadResponse(DWORD status, const std::string& body,
+                              UploadShape shape = UploadShape::kLitterbox) {
   const std::string text = TrimWhitespace(body);
   if (status == 200) {
     if (text.empty()) {
       return Failure("empty-body");
     }
-    if (LooksLikeUploadUrl(text)) {
+    if (LooksLikeHostUrl(text, UploadHost{L"", L"", L"", shape})) {
       Result result;
       result.ok = true;
       result.url = text;
@@ -972,7 +1057,8 @@ UploadAttempt AttemptResult(const Result& result) {
   return attempt;
 }
 
-UploadAttempt UploadMultipartBody(const std::string& body, const std::string& boundary) {
+UploadAttempt UploadMultipartBody(const UploadHost& upload_host, const std::string& body,
+                                  const std::string& boundary) {
   if (body.size() > 0xffffffffull) {
     return AttemptResult(Failure("body-too-large"));
   }
@@ -981,11 +1067,11 @@ UploadAttempt UploadMultipartBody(const std::string& body, const std::string& bo
   if (!session) {
     return TransportFailure("session-open-failed", "connect", GetLastError());
   }
-  WinHttpHandle connection(WinHttpConnect(session.get(), kUploadHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
+  WinHttpHandle connection(WinHttpConnect(session.get(), upload_host.host, INTERNET_DEFAULT_HTTPS_PORT, 0));
   if (!connection) {
     return TransportFailure("connect-failed", "connect", GetLastError());
   }
-  WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"POST", kUploadPath, nullptr, WINHTTP_NO_REFERER,
+  WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"POST", upload_host.path, nullptr, WINHTTP_NO_REFERER,
                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
   if (!request) {
     return TransportFailure("request-open-failed", "send", GetLastError());
@@ -1011,11 +1097,11 @@ UploadAttempt UploadMultipartBody(const std::string& body, const std::string& bo
   const ReadOutcome read = ReadResponseBody(request.get(), deadline, &response);
   if (!read.ok) {
     if (status == 200 || status == 412) {
-      return AttemptResult(ClassifyUploadResponse(status, response));
+      return AttemptResult(ClassifyUploadResponse(status, response, upload_host.shape));
     }
     return TransportFailure(read.tag, "receive", read.error);
   }
-  return AttemptResult(ClassifyUploadResponse(status, response));
+  return AttemptResult(ClassifyUploadResponse(status, response, upload_host.shape));
 }
 
 bool CrackUrl(const std::string& url, std::wstring* host, std::wstring* path) {
@@ -1116,11 +1202,103 @@ HealthCheck HealthCheckUrl(const std::string& url) {
   return check;
 }
 
+// Tries one host: builds that host's own multipart shape, uploads, retries once
+// on a transport failure only, and - on success - proves the returned URL is
+// retrievable. Records the attempt count and a log marker naming the host. A
+// host answer (403/412/empty body) is final for this host; the caller moves on.
+struct HostOutcome {
+  Result result;
+  int attempts = 0;
+};
+
+HostOutcome TryUploadHost(const UploadHost& upload_host, const PreparedImage& prepared) {
+  HostOutcome outcome;
+  const std::string content_type = SanitizeMime(prepared.mime.c_str());
+  const std::string boundary = MakeBoundary();
+  const std::string body = BuildMultipartBody(boundary, content_type, prepared.bytes, upload_host.shape);
+  UploadAttempt attempt = UploadMultipartBody(upload_host, body, boundary);
+  outcome.attempts = 1;
+  if (attempt.transport_failure) {
+    Sleep(kRetryBackoffMs);
+    attempt = UploadMultipartBody(upload_host, body, boundary);
+    outcome.attempts = 2;
+  }
+  outcome.result = attempt.result;
+  if (outcome.result.ok) {
+    const HealthCheck health = HealthCheckUrl(outcome.result.url);
+    if (!health.ok) {
+      outcome.result = Failure(health.reason);
+    }
+  }
+  outcome.result.host = HostNameUtf8(upload_host);
+  outcome.result.attempts = outcome.attempts;
+  return outcome;
+}
+
+// Every configured host, in order, in one comma-separated token for the failure
+// marker: "litter.catbox.moe,uguu.se".
+std::string HostListToken() {
+  std::string token;
+  for (size_t i = 0; i < kUploadHostCount; ++i) {
+    if (i != 0) {
+      token += ",";
+    }
+    token += Utils::ToString(kUploadHosts[i].name);
+  }
+  return token;
+}
+
+// The publisher's diagnostic sink; never image bytes. One small line per publish
+// so a host choice - and the fall-through to online - is greppable in DebugLog.
+void (*g_logger)(const std::string&) = nullptr;
+
+void EmitLog(const std::string& line) {
+  if (g_logger != nullptr) {
+    g_logger(line);
+  }
+}
+
+void LogHostSuccess(const Result& result) {
+  EmitLog("local-cover published host=" + result.host + " url=" + result.url);
+}
+
+void LogHostFailure(const std::string& reason, const std::string& host_list, int attempts,
+                    const PreparedImage& prepared) {
+  EmitLog("local-cover failed host=" + host_list + " reason=" +
+          (reason.empty() ? std::string("unknown") : reason) + " attempts=" +
+          std::to_string(attempts) + " detail=" + prepared.note);
+}
+
+// The publisher is healthy when at least one configured host is reachable - a
+// single dead host is never the whole publisher's verdict. Pure, so the rule is
+// testable without a network: `reachable` is parallel to the configured hosts.
+bool AnyHostHealthy(const bool* reachable, size_t count) {
+  if (reachable == nullptr || count == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (reachable[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+constexpr size_t ConfiguredHostCount() { return kUploadHostCount; }
+
+const char* ConfiguredHostName(size_t index) {
+  return index < kUploadHostCount ? kUploadHostNames[index] : "";
+}
+
 }  // namespace
 
 // --- Public interface -------------------------------------------------------
 
 namespace CoverPublisher {
+
+void SetLogger(void (*logger)(const std::string& line)) {
+  g_logger = logger;
+}
 
 void Configure(const std::string& cache_path) {
   std::lock_guard<std::mutex> lock(g_cache_mutex);
@@ -1148,24 +1326,28 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
       return cached;
     }
 
-    const std::string content_type = SanitizeMime(prepared.mime.c_str());
-    const std::string boundary = MakeBoundary();
-    const std::string body = BuildMultipartBody(boundary, content_type, prepared.bytes);
-    UploadAttempt attempt = UploadMultipartBody(body, boundary);
-    int attempts = 1;
-    if (attempt.transport_failure) {
-      Sleep(kRetryBackoffMs);
-      attempt = UploadMultipartBody(body, boundary);
-      attempts = 2;
-    }
-    Result result = attempt.result;
-    if (result.ok) {
-      const HealthCheck health = HealthCheckUrl(result.url);
-      if (!health.ok) {
-        result = Failure(health.reason);
+    // Ordered fallback inside one publish: try litterbox, then uguu. Both are
+    // the same layer - a host failure never skips the online rung. Each host
+    // builds its own multipart shape and is retried once on a transport failure
+    // only.
+    Result result;
+    int total_attempts = 0;
+    for (size_t i = 0; i < kUploadHostCount; ++i) {
+      const HostOutcome outcome = TryUploadHost(kUploadHosts[i], prepared);
+      total_attempts += outcome.attempts;
+      if (outcome.result.ok) {
+        result = outcome.result;
+        break;
       }
+      result = outcome.result;  // last failure names the final host
     }
-    result.detail = prepared.note + " key=" + key + " attempts=" + std::to_string(attempts);
+    if (result.ok) {
+      LogHostSuccess(result);
+    } else {
+      LogHostFailure(result.reason, HostListToken(), total_attempts, prepared);
+    }
+    result.detail = prepared.note + " key=" + key + " attempts=" + std::to_string(total_attempts) +
+                    " host=" + (result.host.empty() ? HostListToken() : result.host);
     CacheStore(key, result, now);
     return result;
   } catch (...) {

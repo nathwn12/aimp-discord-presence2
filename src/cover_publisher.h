@@ -47,10 +47,20 @@ struct Result {
   bool ok = false;
   std::string url;
   std::string reason;
+  // The host that produced this outcome: the winner on success, the last host
+  // tried on failure (UTF-8, e.g. "litter.catbox.moe" or "uguu.se").
+  std::string host;
+  // Total upload attempts spent across every host tried for this request.
+  int attempts = 0;
   // One-line size/dimension record for the caller's log (never image bytes),
   // populated on every outcome including cache hits.
   std::string detail;
 };
+
+// Routes the publisher's own diagnostic lines (host success / all-hosts-failed)
+// to a sink; when unset they are dropped. Distinct from Result.detail, which is
+// per-outcome, and invoked once per publish attempt on the calling thread.
+void SetLogger(void (*logger)(const std::string& line));
 
 // Names the cache file (UTF-8). An empty path disables the cache entirely.
 // Reloads whatever the file already holds.

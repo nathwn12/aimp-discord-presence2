@@ -36,6 +36,17 @@
 
 namespace {
 
+// The publisher logs through a plain function pointer (it owns no plugin
+// object). This trampoline forwards to the live instance's LogCover, which
+// routes to the DebugLog client. Set once in Load(), cleared in Unload().
+AimpDiscordPresence* g_publisher_log_target = nullptr;
+
+void PublisherLogTrampoline(const std::string& line) {
+  if (g_publisher_log_target != nullptr) {
+    g_publisher_log_target->LogCover(line);
+  }
+}
+
 constexpr int kPlayerStateStopped = 0;
 constexpr int kPlayerStatePaused = 1;
 constexpr int kPlayerStatePlaying = 2;
@@ -182,6 +193,10 @@ bool AimpDiscordPresence::Load() {
   // cover is uploaded once and reused. Configuring it never touches the
   // network; an unusable path only costs the on-disk cache.
   CoverPublisher::Configure(ResolveCoverCachePath(settings.cover_cache));
+  // Route the publisher's host-choice and all-hosts-failed lines into the same
+  // DebugLog as the cover vocabulary.
+  g_publisher_log_target = this;
+  CoverPublisher::SetLogger(&PublisherLogTrampoline);
 
   // Single publisher worker. It owns no AIMP object, only the bytes it is
   // handed, and it is joined in Unload().
@@ -259,6 +274,11 @@ void AimpDiscordPresence::LoadConfigValue(Aimp::Core::Service::Config config, co
 
 bool AimpDiscordPresence::Unload() {
   Aimp::Messages::Service::MessageDispatcher().UnhookAll();
+
+  // Stop the publisher's log hook before the instance goes away, so a late
+  // worker line can never touch a dead plugin.
+  CoverPublisher::SetLogger(nullptr);
+  g_publisher_log_target = nullptr;
 
   // Joins the publisher worker: it holds only queued image bytes, so it can be
   // stopped without an AIMP object ever crossing threads.
@@ -375,6 +395,12 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   // A URL is only ever adopted when an upload proved retrievable, so the
   // online chain's URL or the black fallback stays in place until then. Runs
   // before SetInfo() so a known URL lands in this same update.
+  // Local cover layers (1 and 2): the track's own embedded art, or a sidecar
+  // image the extractor found. `local_art_found` records that a local cover
+  // exists; when publishing it fails, the online rung below must still be asked
+  // - black is only for a track where every layer failed.
+  bool local_art_found = false;
+  bool local_published = false;
   if (request_artwork && info.key != local_art_key_) {
     local_art_key_ = info.key;
     // A cover queued for the previous track must not be applied to this one.
@@ -383,8 +409,14 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
       LocalArt::Result art =
           ExtractLocalArt(info, settings.use_albumart && settings.local_cover);
       if (art.found) {
+        local_art_found = true;
         local_cover_sha_ = art.sha256_hex;
         MaybePublishLocalCover(info, std::move(art));
+        // MaybePublishLocalCover applies a URL synchronously only on a known
+        // hit; an in-flight upload leaves local_cover_url_ empty, and that is
+        // exactly the case that must fall through to online rather than black.
+        std::lock_guard<std::mutex> lock(presence_mutex_);
+        local_published = !local_cover_url_.empty();
       }
     }
   }
@@ -402,12 +434,14 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   track_file_ = info.file;
 
   if (request_artwork) {
-    if (PresenceLayout::ShouldRequestOnlineArtwork(
+    if (PresenceLayout::ShouldRequestOnlineForTrack(
             settings.use_albumart, settings.use_albumart_online, info.artist,
-            info.album)) {
+            local_art_found, local_published)) {
       // Non-blocking: the worker resolves the URL and publishes it, the next
       // notification applies it. The album tag is not required: an album-less
-      // track still gets a keyless lookup, keyed by artist + file path.
+      // track still gets a keyless lookup, keyed by artist + file path. A local
+      // cover that was found never suppresses this request: if its publish
+      // fails, the online rung below is what keeps the card off black.
       album_art_.Request(info.artist, info.album, info.file);
     } else {
       std::lock_guard<std::mutex> lock(presence_mutex_);
@@ -511,6 +545,7 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
     std::string url;
     std::string reason;
     std::string detail;
+    std::string host;
     {
       std::lock_guard<std::mutex> lock(cover_mutex_);
       if (cover_result_ready_) {
@@ -519,30 +554,36 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
         url = cover_result_url_;
         reason = cover_result_reason_;
         detail = cover_result_detail_;
+        host = cover_result_host_;
         cover_result_hash_.clear();
         cover_result_url_.clear();
         cover_result_reason_.clear();
         cover_result_detail_.clear();
+        cover_result_host_.clear();
         cover_result_ready_ = false;
       }
     }
 
     if (!hash.empty()) {
       if (!ok) {
-        // The gate at work: no local URL is adopted, and the reason is on
-        // record. The publisher's own negative cache keeps a dead host from
-        // being retried immediately.
+        // The gate at work: no local URL is adopted, the host that failed is
+        // on record, and the online rung (or black) stays in place. The
+        // publisher's own negative cache keeps a dead host from being retried
+        // immediately.
         LogCover("local-cover failed hash=" + hash +
+                 " host=" + (host.empty() ? "unknown" : host) +
                  " reason=" + (reason.empty() ? "unknown" : reason) +
                  " detail=" + (detail.empty() ? "unknown" : detail));
       } else {
         // Remember the URL even when the track has moved on, so the image is
         // never uploaded twice in one session.
         local_cover_urls_[hash] = url;
-        // Once per cover: what was prepared, what was transferred, which key
-        // the cache used. Sizes and hashes only - never bytes.
-        LogCover("local-cover published hash=" + hash + " url=" + url + " detail=" +
-                 (detail.empty() ? "unknown" : detail));
+        // Once per cover: which host served it, what was prepared, what was
+        // transferred, which key the cache used. Sizes and hashes only - never
+        // bytes.
+        LogCover("local-cover published hash=" + hash +
+                 " host=" + (host.empty() ? "unknown" : host) + " url=" + url +
+                 " detail=" + (detail.empty() ? "unknown" : detail));
         if (hash == local_cover_sha_) {
           std::lock_guard<std::mutex> lock(presence_mutex_);
           local_cover_url_ = url;
@@ -693,6 +734,7 @@ void AimpDiscordPresence::CoverWorkerMain() {
       cover_result_url_ = result.url;
       cover_result_reason_ = result.reason;
       cover_result_detail_ = result.detail;
+      cover_result_host_ = result.host;
       cover_result_ready_ = true;
     }
   }

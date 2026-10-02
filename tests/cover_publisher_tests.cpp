@@ -99,6 +99,88 @@ void TestClassifier() {
 
   const Result junk = ClassifyUploadResponse(200, "not a url");
   Check(!junk.ok && junk.reason.find("200") != std::string::npos, "200 + junk -> reason names status");
+
+  // Strict success classification per host: only that host's own bare URL.
+  const Result litterbox_ok = ClassifyUploadResponse(200, url, UploadShape::kLitterbox);
+  Check(litterbox_ok.ok && litterbox_ok.url == url, "litterbox 200 + litterbox url -> ok");
+
+  const std::string uguu_url = "https://n.uguu.se/nUoxUKCo.png";
+  const Result uguu_ok = ClassifyUploadResponse(200, uguu_url, UploadShape::kUguu);
+  Check(uguu_ok.ok && uguu_ok.url == uguu_url, "uguu 200 + uguu url -> ok");
+  const Result uguu_trimmed =
+      ClassifyUploadResponse(200, uguu_url + "\r\n", UploadShape::kUguu);
+  Check(uguu_trimmed.ok && uguu_trimmed.url == uguu_url,
+        "uguu 200 + url with newline -> ok, trimmed");
+
+  // A 200 whose body is an HTML page, a JSON blob, or the wrong host's URL is a
+  // failure: the response must be a bare URL, never arbitrary text.
+  const Result html = ClassifyUploadResponse(
+      200, "<html><body>Forbidden</body></html>", UploadShape::kUguu);
+  Check(!html.ok && html.reason == "http-200-unexpected-body",
+        "200 + html page -> failure");
+  const Result json = ClassifyUploadResponse(
+      200, "{\"success\":true,\"files\":[{\"url\":\"https://n.uguu.se/x.png\"}]}",
+      UploadShape::kUguu);
+  Check(!json.ok && json.reason == "http-200-unexpected-body",
+        "200 + json blob -> failure");
+  const Result wrong_host = ClassifyUploadResponse(200, url, UploadShape::kUguu);
+  Check(!wrong_host.ok && wrong_host.reason == "http-200-unexpected-body",
+        "a litterbox url is not accepted for the uguu host");
+  const Result uguu_empty = ClassifyUploadResponse(200, "", UploadShape::kUguu);
+  Check(!uguu_empty.ok && uguu_empty.reason == "empty-body",
+        "uguu 200 + empty body -> failure");
+
+  // A WAF 403 (the measured litterbox failure) names its status and is never ok.
+  const Result forbidden = ClassifyUploadResponse(403, "<html>BunkerWeb</html>");
+  Check(!forbidden.ok && forbidden.reason == "http-403", "403 -> failure named by status");
+}
+
+// --- Ordered host fallback: litterbox first, then uguu ---------------------
+
+// Mirrors CoverPublisher::Publish's host loop as a pure decision over per-host
+// outcomes, so the ordered fallback is asserted without touching the network.
+Result RunHostFallback(const std::vector<Result>& per_host) {
+  Result last;
+  for (size_t i = 0; i < per_host.size(); ++i) {
+    last = per_host[i];
+    if (last.ok) {
+      return last;
+    }
+  }
+  return last;
+}
+
+void TestHostFallback() {
+  const std::string uguu_url = "https://n.uguu.se/nUoxUKCo.png";
+
+  // Host 1 fails with 403, host 2 succeeds: overall ok with host 2's URL.
+  std::vector<Result> outcomes;
+  outcomes.push_back(ClassifyUploadResponse(403, "<html>BunkerWeb</html>"));
+  outcomes.push_back(ClassifyUploadResponse(200, uguu_url, UploadShape::kUguu));
+  const Result fell_back = RunHostFallback(outcomes);
+  Check(!outcomes[0].ok, "host fallback: host 1's 403 is a failure");
+  Check(fell_back.ok && fell_back.url == uguu_url,
+        "host fallback: first host 403 and second succeeds -> ok with host 2 url");
+
+  // All hosts fail: overall failure. The caller must then try the online rung,
+  // not jump to black.
+  std::vector<Result> all_fail;
+  all_fail.push_back(ClassifyUploadResponse(403, ""));
+  all_fail.push_back(ClassifyUploadResponse(503, ""));
+  const Result none = RunHostFallback(all_fail);
+  Check(!none.ok, "host fallback: all hosts failing is an overall failure");
+
+  const std::string online_url =
+      "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
+  const std::string key = AlbumArt::BuildAlbumKey("Daft Punk", "Discovery", "");
+  Check(PresenceLayout::ResolveCoverLayer("", "", online_url) ==
+            PresenceLayout::CoverLayer::kOnlineKeyless,
+        "host fallback: all hosts failed and online resolved -> the online layer");
+  std::string source;
+  Check(PresenceLayout::ResolveLargeImage(key, "", "", key, online_url, &source) ==
+            online_url &&
+            source == "online",
+        "host fallback: no local url, online url wins over black");
 }
 
 // --- Multipart arithmetic ---------------------------------------------------
@@ -112,10 +194,10 @@ void TestClassifier() {
 void TestMultipartArithmetic() {
   const std::vector<unsigned char> image(4321, 0x7f);
   const std::string boundary = MakeBoundary();
-  const std::string prefix = MultipartPrefix(boundary, "image/png");
+  const std::string prefix = MultipartPrefix(boundary, "image/png", UploadShape::kLitterbox);
   const std::string suffix = MultipartSuffix(boundary);
-  const std::string body = BuildMultipartBody(boundary, "image/png", image);
-  const std::string jpeg_prefix = MultipartPrefix(boundary, "image/jpeg");
+  const std::string body = BuildMultipartBody(boundary, "image/png", image, UploadShape::kLitterbox);
+  const std::string jpeg_prefix = MultipartPrefix(boundary, "image/jpeg", UploadShape::kLitterbox);
 
   Check(prefix.size() == 315, "png prefix is 315 bytes");
   Check(suffix.size() == 37, "suffix is 37 bytes");
@@ -135,10 +217,78 @@ void TestMultipartArithmetic() {
   Check(body.find("fileupload\r\n") != std::string::npos && body.find("72h\r\n") != std::string::npos,
         "field values are present");
 
-  const std::string unknown = MultipartPrefix(boundary, "application/octet-stream");
+  const std::string unknown =
+      MultipartPrefix(boundary, "application/octet-stream", UploadShape::kLitterbox);
   Check(unknown.find("filename=\"cover.bin\"") != std::string::npos &&
             unknown.find("Content-Type: application/octet-stream\r\n") != std::string::npos,
         "unknown mime keeps a truthful filename and content type");
+}
+
+// --- Upload host list: ordered, with each host's own shape ------------------
+
+void TestHostList() {
+  Check(kUploadHostCount == 2, "host list has exactly two hosts");
+  Check(ConfiguredHostCount() == 2, "configured host count matches");
+
+  // Order is the fallback order: litterbox first, uguu second. A host failure
+  // moves down the list, never to a different layer.
+  Check(std::string(ConfiguredHostName(0)) == "litter.catbox.moe",
+        "host 0 is litterbox");
+  Check(std::string(ConfiguredHostName(1)) == "uguu.se", "host 1 is uguu");
+  Check(ConfiguredHostName(2)[0] == '\0', "an out-of-range host name is empty");
+
+  // Each entry carries its own endpoint and multipart shape.
+  Check(std::wstring(kUploadHosts[0].host) == L"litterbox.catbox.moe" &&
+            std::wstring(kUploadHosts[0].path) == L"/resources/internals/api.php" &&
+            kUploadHosts[0].shape == UploadShape::kLitterbox,
+        "litterbox owns its endpoint and fileToUpload shape");
+  Check(std::wstring(kUploadHosts[1].host) == L"uguu.se" &&
+            std::wstring(kUploadHosts[1].path) == L"/upload?output=text" &&
+            kUploadHosts[1].shape == UploadShape::kUguu,
+        "uguu owns its endpoint and files[] shape");
+}
+
+// --- Multipart shapes differ correctly per host ----------------------------
+
+void TestMultipartShapes() {
+  const std::vector<unsigned char> image(64, 0x2a);
+  const std::string boundary = "----testboundary";
+
+  const std::string litterbox =
+      BuildMultipartBody(boundary, "image/png", image, UploadShape::kLitterbox);
+  Check(litterbox.find("name=\"fileToUpload\"") != std::string::npos,
+        "litterbox body uses the fileToUpload field");
+  Check(litterbox.find("name=\"reqtype\"") != std::string::npos,
+        "litterbox body carries reqtype");
+  Check(litterbox.find("name=\"time\"") != std::string::npos,
+        "litterbox body carries time");
+  Check(litterbox.find("72h\r\n") != std::string::npos, "litterbox time is 72h");
+  Check(litterbox.find("name=\"files[]\"") == std::string::npos,
+        "litterbox body never uses the uguu field name");
+
+  const std::string uguu =
+      BuildMultipartBody(boundary, "image/png", image, UploadShape::kUguu);
+  Check(uguu.find("name=\"files[]\"") != std::string::npos,
+        "uguu body uses the files[] field");
+  Check(uguu.find("name=\"fileToUpload\"") == std::string::npos,
+        "uguu body never uses the litterbox field name");
+  Check(uguu.find("name=\"reqtype\"") == std::string::npos &&
+            uguu.find("name=\"time\"") == std::string::npos,
+        "uguu body carries no extra fields");
+  Check(uguu.find("filename=\"cover.png\"") != std::string::npos &&
+            uguu.find("\r\nContent-Type: image/png\r\n") != std::string::npos,
+        "uguu file part keeps filename and content type");
+
+  // The two shapes genuinely differ, and each keeps the one-part framing.
+  Check(litterbox != uguu, "the two host bodies differ");
+  Check(uguu.size() < litterbox.size(), "uguu's single part is smaller than litterbox's three");
+  Check(uguu.size() == uguu.find("--" + boundary + "--") + 0 ||
+            uguu.find("--" + boundary + "--\r\n") ==
+                uguu.size() - ("--" + boundary + "--\r\n").size(),
+        "uguu body closes with the boundary delimiter");
+  // The image bytes still land exactly once in each body.
+  Check(uguu.find(std::string(64, 0x2a)) != std::string::npos,
+        "uguu body carries the image bytes");
 }
 
 void TestBoundary() {
@@ -273,6 +423,108 @@ void TestCoverFallbackChain() {
   // The fallback URL fits Discord's external-asset length limit.
   Check(std::strlen(PresenceLayout::kFallbackLargeImageUrl) <= AlbumArt::kMaxUrlLength,
         "chain: black png url fits the discord asset url limit");
+}
+
+// --- The explicit four-layer chain, in order -------------------------------
+
+void TestCoverLayerOrder() {
+  using PresenceLayout::CoverLayer;
+  using PresenceLayout::ResolveCoverLayer;
+
+  const std::string embedded = "https://litter.catbox.moe/abc123.png";
+  const std::string sidecar = "https://n.uguu.se/nUoxUKCo.png";
+  const std::string online =
+      "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
+
+  // Layer 1: embedded art published -> embedded wins, nothing below is used.
+  Check(ResolveCoverLayer(embedded, sidecar, online) == CoverLayer::kLocalEmbedded,
+        "layer 1: published embedded art is the chosen layer");
+  Check(ResolveCoverLayer(embedded, "", "") == CoverLayer::kLocalEmbedded,
+        "layer 1: embedded wins even when nothing else resolved");
+
+  // Layer 2: no embedded art, a sidecar published -> sidecar wins.
+  Check(ResolveCoverLayer("", sidecar, online) == CoverLayer::kLocalSidecar,
+        "layer 2: a published sidecar wins when embedded art is absent");
+  Check(ResolveCoverLayer("", sidecar, "") == CoverLayer::kLocalSidecar,
+        "layer 2: sidecar wins even when online did not resolve");
+
+  // Layer 3: neither local layer delivered, online resolved -> online wins.
+  Check(ResolveCoverLayer("", "", online) == CoverLayer::kOnlineKeyless,
+        "layer 3: online wins when both local layers failed");
+
+  // Layer 4: black is reached ONLY when all three above produced nothing.
+  Check(ResolveCoverLayer("", "", "") == CoverLayer::kBlackPng,
+        "layer 4: black only when embedded, sidecar and online all failed");
+
+  // A local art extract that could not be published leaves its URL empty, so
+  // the chain descends to online - never straight to black.
+  const std::string embedded_failed = "";   // extracted but upload failed
+  const std::string sidecar_failed = "";    // sidecar found but upload failed
+  Check(ResolveCoverLayer(embedded_failed, sidecar_failed, online) ==
+            CoverLayer::kOnlineKeyless,
+        "layer order: a failed local publish falls through to online, not black");
+  Check(ResolveCoverLayer(embedded_failed, sidecar_failed, online) !=
+            CoverLayer::kBlackPng,
+        "layer order: black is not chosen while online resolved");
+
+  // The layer names are stable and greppable.
+  Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kLocalEmbedded)) ==
+            "local-embedded",
+        "layer names: 1 is local-embedded");
+  Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kLocalSidecar)) ==
+            "local-sidecar",
+        "layer names: 2 is local-sidecar");
+  Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kOnlineKeyless)) ==
+            "online-keyless",
+        "layer names: 3 is online-keyless");
+  Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kBlackPng)) == "black-png",
+        "layer names: 4 is black-png");
+
+  // The online request is never suppressed by a local cover existing: a track
+  // whose local art was found (and may still fail to publish) still asks online.
+  Check(PresenceLayout::ShouldRequestOnlineForTrack(true, true, "Daft Punk", true, false),
+        "layer order: local art found, not yet published -> online still requested");
+  Check(PresenceLayout::ShouldRequestOnlineForTrack(true, true, "Daft Punk", true, true),
+        "layer order: local art published -> online request still permitted");
+  Check(PresenceLayout::ShouldRequestOnlineForTrack(true, true, "Daft Punk", false, false),
+        "layer order: no local art -> online requested");
+  Check(!PresenceLayout::ShouldRequestOnlineForTrack(true, false, "Daft Punk", true, false),
+        "layer order: online disabled still suppresses the request");
+  Check(!PresenceLayout::ShouldRequestOnlineForTrack(true, true, "", true, false),
+        "layer order: an empty artist still suppresses the request");
+}
+
+// --- Publish pending: the card is not blanked ------------------------------
+
+void TestPublishPendingNotBlank() {
+  using PresenceLayout::CoverLayer;
+  using PresenceLayout::ResolveCoverLayer;
+
+  // While a local publish is in flight (no URL yet) the online rung may not
+  // have resolved either; the resolver is allowed to show black only when the
+  // caller has no usable URL. The *card* is not blanked because SetInfo only
+  // ever runs ResolveLargeImage, which returns a URL (black included), never an
+  // empty string.
+  const std::string black = PresenceLayout::kFallbackLargeImageUrl;
+  Check(!black.empty(), "pending: the resolver never yields an empty image url");
+  Check(black == PresenceLayout::BuildLargeImage(""),
+        "pending: an empty artwork url resolves to the black png, not a blank");
+  Check(ResolveCoverLayer("", "", "") == CoverLayer::kBlackPng,
+        "pending: with nothing resolved yet the black png still holds the card");
+
+  // The existing gate: a previous large_image is held until a *new* value is
+  // resolved. Applying the same value is a no-op, so a pending publish cannot
+  // blank the card by re-applying black over black.
+  const std::string key = AlbumArt::BuildAlbumKey("Daft Punk", "Discovery", "");
+  const std::string resolved_pending =
+      PresenceLayout::ResolveLargeImage(key, "", "", "", "", nullptr);
+  Check(resolved_pending == black,
+        "pending: no local url and no online url resolves to the black png");
+  // Once a local or online URL lands, it differs from black and is applied.
+  const std::string after_publish =
+      PresenceLayout::ResolveLargeImage(key, key, "https://n.uguu.se/abc.png", "", "", nullptr);
+  Check(after_publish != resolved_pending,
+        "pending: a landed local url is a change the card applies");
 }
 
 // --- Online rung: decision outcomes (offline, pure functions) ---------------

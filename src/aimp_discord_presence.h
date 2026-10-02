@@ -47,6 +47,10 @@ class AimpDiscordPresence :
   void Notification(int id, IUnknown* data) override;
   void ShowSettings(HWND parent_wnd) override;
 
+  // Routes a diagnostic line to the DebugLog client. Public so the publisher's
+  // plain-function-pointer log hook can forward here without an instance.
+  void LogCover(const std::string& line);
+
  private:
   struct TrackInfo {
     std::string key;
@@ -99,7 +103,6 @@ class AimpDiscordPresence :
   // Publisher worker: blocks on its own mailbox and owns no AIMP object.
   void CoverWorkerMain();
   void StopCoverWorker();
-  void LogCover(const std::string& line);
 
   // Large-image value for `album_key`; must be called with presence_mutex_
   // held. A published local cover wins over the online chain's URL, which wins
@@ -203,6 +206,8 @@ class AimpDiscordPresence :
   std::string cover_result_url_;
   std::string cover_result_reason_;
   std::string cover_result_detail_;
+  // Which upload host produced this outcome (winner on ok, last tried on fail).
+  std::string cover_result_host_;
 };
 
 #endif  // AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_

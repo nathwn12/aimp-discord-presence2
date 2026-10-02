@@ -135,6 +135,72 @@ inline std::string ResolveLargeImage(const std::string& album_key,
   return BuildLargeImage(std::string());
 }
 
+// The cover chain as four explicit layers, in priority order. This is the
+// single statement of the required fallback order; the resolver above is its
+// URL-producing form. A track descends the chain only by surviving every layer
+// above it - a host failure inside kLocalEmbedded/kLocalSidecar is still that
+// same layer and must not skip kOnlineKeyless.
+enum class CoverLayer {
+  // 1. The track's own embedded art, published to a host.
+  kLocalEmbedded = 1,
+  // 2. A sidecar image in the track folder (or up to 4 ancestors), published.
+  kLocalSidecar = 2,
+  // 3. The keyless online chain (Deezer / iTunes / MusicBrainz+CoverArtArchive).
+  kOnlineKeyless = 3,
+  // 4. The black PNG. Only reached when 1, 2 and 3 all fail.
+  kBlackPng = 4,
+};
+
+inline const char* CoverLayerName(CoverLayer layer) {
+  switch (layer) {
+    case CoverLayer::kLocalEmbedded:
+      return "local-embedded";
+    case CoverLayer::kLocalSidecar:
+      return "local-sidecar";
+    case CoverLayer::kOnlineKeyless:
+      return "online-keyless";
+    case CoverLayer::kBlackPng:
+      return "black-png";
+  }
+  return "black-png";
+}
+
+// The layer that actually supplies the image, given what each layer produced.
+// `embedded_url` and `sidecar_url` are published local URLs (empty means that
+// layer did not deliver - extraction failed, or the upload did not prove
+// retrievable); `online_url` is the keyless chain's URL (empty means it did not
+// resolve). Every URL is already key-guarded by the caller, so this function is
+// pure ordering. Black is returned only when all three URLs are empty.
+inline CoverLayer ResolveCoverLayer(const std::string& embedded_url,
+                                    const std::string& sidecar_url,
+                                    const std::string& online_url) {
+  if (!embedded_url.empty()) {
+    return CoverLayer::kLocalEmbedded;
+  }
+  if (!sidecar_url.empty()) {
+    return CoverLayer::kLocalSidecar;
+  }
+  if (!online_url.empty()) {
+    return CoverLayer::kOnlineKeyless;
+  }
+  return CoverLayer::kBlackPng;
+}
+
+// Whether the online rung must be asked for this track given the local layers'
+// state. The online rung is requested whenever the artist is known and online
+// is enabled - including when local art was found, because a local extract can
+// still fail to publish and must then fall through to online, never to black.
+// `local_art_found` and `local_published` therefore both keep the request live:
+// they never suppress it. Only the settings and an empty artist do.
+inline bool ShouldRequestOnlineForTrack(bool use_albumart, bool use_online,
+                                        const std::string& artist,
+                                        bool local_art_found,
+                                        bool local_published) {
+  (void)local_art_found;
+  (void)local_published;
+  return ShouldRequestOnlineArtwork(use_albumart, use_online, artist, std::string());
+}
+
 }  // namespace PresenceLayout
 
 #endif  // AIMPDISCORDPRESENCE_SRC_PRESENCE_LAYOUT_H_
