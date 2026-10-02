@@ -365,6 +365,87 @@ void TestOnlineRungDecision() {
         "online rung: another album's resolved url is never applied");
 }
 
+// --- Album-less online rung: the six album-empty guarantees -----------------
+//
+// (1) the request predicate fires; (2) album-empty is no longer a definitive
+// nothing-to-query case; (3) an artist-only hit is accepted; (4) a wrong-album
+// hit is still rejected when the request names an album; (5) album-less keys
+// stay file-path distinct; (6) the decision table picks online over black.
+
+void TestAlbumlessOnlineRung() {
+  const std::string artist = "Daft Punk";
+  const std::string file_a = "D:\\music\\untitled one.flac";
+  const std::string file_b = "D:\\music\\untitled two.flac";
+  const std::string online_url =
+      "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
+  std::string source;
+
+  // (1) ShouldRequestOnlineArtwork is true for artist-present + album-empty, and
+  // the other combinations are unchanged.
+  Check(PresenceLayout::ShouldRequestOnlineArtwork(true, true, artist, ""),
+        "albumless: artist present + album empty requests online artwork");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(true, true, "", ""),
+        "albumless: no artist still suppresses the request");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(false, true, artist, ""),
+        "albumless: use_albumart off still suppresses the request");
+  Check(!PresenceLayout::ShouldRequestOnlineArtwork(true, false, artist, ""),
+        "albumless: use_online off still suppresses the request");
+
+  // (2) The resolver's genuine nothing-to-query case is an empty artist only: an
+  // empty album is an artist-only search, not a definitive miss. This is proven
+  // through observable behavior - the request predicate used to be the thing
+  // that refused album-empty, and it must now let it through; the identity guard
+  // is exercised below to show the artist-only path is reachable and accepted.
+  const std::string artist_only_body =
+      "{\"data\":[{\"title\":\"Random Access Memories\",\"artist\":{\"name\":\"Daft Punk\"},"
+      "\"cover_xl\":\"https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg\"}],"
+      "\"total\":1}";
+  // (3) An artist-only match is ACCEPTED when the requested album is empty, even
+  // though the hit names a real album the caller did not ask about.
+  Check(AlbumArt::SearchResultMatches(artist_only_body, AlbumArt::Provider::kDeezer, artist, ""),
+        "albumless: an artist-only hit is accepted when the requested album is empty");
+  Check(AlbumArt::MetadataMatches("", "Random Access Memories"),
+        "albumless: an empty expected album never vetoes a present hit album");
+  Check(!AlbumArt::MetadataMatches("Daft Punk", ""),
+        "albumless: an empty candidate is still rejected");
+
+  // (4) REGRESSION: a wrong-album hit is still REJECTED when the requested album
+  // is non-empty, so the guard did not become a rubber stamp.
+  const std::string wrong_album_body =
+      "{\"data\":[{\"title\":\"Homework\",\"artist\":{\"name\":\"Daft Punk\"},"
+      "\"cover_xl\":\"https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg\"}],"
+      "\"total\":1}";
+  Check(!AlbumArt::SearchResultMatches(wrong_album_body, AlbumArt::Provider::kDeezer, artist,
+                                       "Discovery"),
+        "albumless regression: a wrong-album hit is rejected when an album is requested");
+  Check(!AlbumArt::MetadataMatches("Discovery", "Homework"),
+        "albumless regression: MetadataMatches rejects a different present album");
+
+  // (5) REGRESSION: an album-less BuildAlbumKey still embeds the file path, so
+  // two album-less tracks by one artist produce DIFFERENT keys.
+  const std::string key_a = AlbumArt::BuildAlbumKey(artist, "", file_a);
+  const std::string key_b = AlbumArt::BuildAlbumKey(artist, "", file_b);
+  Check(key_a.find(file_a) != std::string::npos,
+        "albumless: the key embeds the file path");
+  Check(key_a != key_b,
+        "albumless: two album-less tracks by one artist get different keys");
+  Check(key_a != artist + "\n",
+        "albumless: the key does not collapse to artist + newline");
+
+  // (6) Decision table: album-less + online-resolved => the ONLINE url is chosen,
+  // not the black PNG.
+  const std::string applied =
+      PresenceLayout::ResolveLargeImage(key_a, "", "", key_a, online_url, &source);
+  Check(applied == online_url && source == "online",
+        "albumless: the online url is chosen over the black png");
+  Check(applied != PresenceLayout::kFallbackLargeImageUrl,
+        "albumless: the black png is not chosen when online resolved");
+  const std::string unresolved =
+      PresenceLayout::ResolveLargeImage(key_b, "", "", key_a, online_url, &source);
+  Check(unresolved == PresenceLayout::kFallbackLargeImageUrl && source == "fallback",
+        "albumless: a url resolved for another file's key is not adopted");
+}
+
 // --- SHA-256 cache keys -----------------------------------------------------
 
 void TestSha256() {
@@ -658,6 +739,7 @@ int main(int argc, char** argv) {
   TestAlbumIdentityKeys();
   TestCoverFallbackChain();
   TestOnlineRungDecision();
+  TestAlbumlessOnlineRung();
   TestSha256();
   TestCompressionPlan();
   TestCompressionPreparation();

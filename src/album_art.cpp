@@ -477,36 +477,6 @@ std::vector<std::string> SplitWords(const std::string& normalized) {
   return words;
 }
 
-// Word-prefix agreement: after normalization the shorter string's whole words
-// must match the longer string's leading words. "Discovery" matches "Discovery
-// (Deluxe Edition)" and "Live at Madison Square Garden" matches its "(Live)"
-// variant, while "Program Music I" does not match "Program Music III" because
-// the final words differ.
-bool MetadataMatches(const std::string& expected, const std::string& candidate) {
-  const std::string normalized_expected = NormalizeForMatch(expected);
-  const std::string normalized_candidate = NormalizeForMatch(candidate);
-  if (normalized_expected.empty() || normalized_candidate.empty()) {
-    return false;
-  }
-  if (normalized_expected == normalized_candidate) {
-    return true;
-  }
-
-  const std::vector<std::string> expected_words = SplitWords(normalized_expected);
-  const std::vector<std::string> candidate_words = SplitWords(normalized_candidate);
-  const std::vector<std::string>& short_words =
-      expected_words.size() <= candidate_words.size() ? expected_words : candidate_words;
-  const std::vector<std::string>& long_words =
-      expected_words.size() <= candidate_words.size() ? candidate_words : expected_words;
-
-  for (size_t index = 0; index < short_words.size(); ++index) {
-    if (short_words[index] != long_words[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-
 // Reads the first hit's artist and album out of a search response. Only the
 // response shapes of the providers that are actually queried are handled; false
 // means the response carried no usable hit identity.
@@ -582,19 +552,25 @@ std::string BuildDeezerSearchUrl(const std::string& artist, const std::string& a
   // free-text query returns the same album objects, including `cover_xl`, so
   // the album endpoint is queried with free text and the light identity guard
   // rejects the occasional wrong first hit.
+  // An album-less track has nothing to append, so the free-text query is the
+  // artist alone (with no trailing space).
+  const std::string terms = album.empty() ? artist : artist + " " + album;
   std::string url = "https://";
   url += kDeezerHost;
   url += "/search/album?q=";
-  url += UriEncodeUtf8(artist + " " + album);
+  url += UriEncodeUtf8(terms);
   url += "&limit=1";
   return url;
 }
 
 std::string BuildItunesSearchUrl(const std::string& artist, const std::string& album) {
+  // An album-less track has nothing to append, so the free-text term is the
+  // artist alone (with no trailing space).
+  const std::string terms = album.empty() ? artist : artist + " " + album;
   std::string url = "https://";
   url += kItunesHost;
   url += "/search?term=";
-  url += UriEncodeUtf8(artist + " " + album);
+  url += UriEncodeUtf8(terms);
   url += "&media=music&limit=1";
   return url;
 }
@@ -617,8 +593,12 @@ std::string BuildMusicBrainzReleaseGroupUrl(const std::string& artist,
     return escaped;
   };
 
-  const std::string query = "artist:\"" + escape_term(artist) + "\" AND releasegroup:\"" +
-                            escape_term(album) + "\"";
+  // An album-less track has no release group to name, so the releasegroup
+  // clause is omitted and the artist clause alone is searched.
+  const std::string query =
+      album.empty() ? "artist:\"" + escape_term(artist) + "\""
+                    : "artist:\"" + escape_term(artist) + "\" AND releasegroup:\"" +
+                          escape_term(album) + "\"";
   std::string url = "https://";
   url += kMusicBrainzHost;
   url += "/ws/2/release-group/?query=";
@@ -653,6 +633,44 @@ std::string ExtractMusicBrainzReleaseGroupId(const std::string& body) {
   return ExtractJsonStringField(body.substr(anchor), "id");
 }
 
+// Word-prefix agreement: after normalization the shorter string's whole words
+// must match the longer string's leading words. "Discovery" matches "Discovery
+// (Deluxe Edition)" and "Live at Madison Square Garden" matches its "(Live)"
+// variant, while "Program Music I" does not match "Program Music III" because
+// the final words differ. Declared in the header; defined here, outside the
+// anonymous namespace, because SearchResultMatches (inside it) calls it.
+bool MetadataMatches(const std::string& expected, const std::string& candidate) {
+  const std::string normalized_expected = NormalizeForMatch(expected);
+  const std::string normalized_candidate = NormalizeForMatch(candidate);
+  // A genuinely empty candidate is never a match. An empty *requested* value
+  // means the caller is not comparing that field at all (an artist-only album
+  // lookup), so it does not veto the comparison. A present expected value is
+  // still compared strictly.
+  if (normalized_candidate.empty()) {
+    return false;
+  }
+  if (normalized_expected.empty()) {
+    return true;
+  }
+  if (normalized_expected == normalized_candidate) {
+    return true;
+  }
+
+  const std::vector<std::string> expected_words = SplitWords(normalized_expected);
+  const std::vector<std::string> candidate_words = SplitWords(normalized_candidate);
+  const std::vector<std::string>& short_words =
+      expected_words.size() <= candidate_words.size() ? expected_words : candidate_words;
+  const std::vector<std::string>& long_words =
+      expected_words.size() <= candidate_words.size() ? candidate_words : expected_words;
+
+  for (size_t index = 0; index < short_words.size(); ++index) {
+    if (short_words[index] != long_words[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool SearchResultMatches(const std::string& body, Provider provider,
                          const std::string& artist, const std::string& album) {
   std::string hit_artist;
@@ -660,6 +678,10 @@ bool SearchResultMatches(const std::string& body, Provider provider,
   if (!ExtractSearchHitIdentity(body, provider, &hit_artist, &hit_album)) {
     return false;
   }
+  // An empty album is an artist-only request: the guard compares the artist and
+  // deliberately does not compare the album (see MetadataMatches), so a hit for
+  // a real album by that artist is adopted. A present album is compared
+  // strictly, so a hit naming a different album is still rejected.
   return MetadataMatches(artist, hit_artist) && MetadataMatches(album, hit_album);
 }
 
@@ -803,8 +825,12 @@ std::string Resolver::LookupUncached(const std::string& artist, const std::strin
                                      bool* definitive) {
   *definitive = false;
 
-  if (artist.empty() || album.empty()) {
-    // There is nothing to query and no point in retrying later.
+  if (artist.empty()) {
+    // There is genuinely nothing to query and no point in retrying later. An
+    // empty album is not nothing: the providers are searched by artist alone and
+    // the identity guard accepts an artist-only hit (see SearchResultMatches),
+    // so an album-less track still reaches the online chain instead of being
+    // refused here and falling through to the black PNG.
     *definitive = true;
     return std::string();
   }

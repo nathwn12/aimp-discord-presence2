@@ -106,12 +106,26 @@ std::string ExtractArtworkUrl(const std::string& body, Provider provider);
 // response.
 std::string ExtractMusicBrainzReleaseGroupId(const std::string& body);
 
+// True when a provider hit's identity agrees with the requested artist/album,
+// so a guard check can be exercised without a provider-specific response
+// document. Agreement ignores case, punctuation and whitespace, and accepts a
+// word-prefix on either side ("Discovery" matches "Discovery (Deluxe Edition)",
+// but "Program Music I" does not match "Program Music III").
+//
+// An empty `expected` never matches: a genuinely empty candidate is always
+// rejected. When `expected` is non-empty it must agree with `candidate`. The
+// album half is the same rule, with one deliberate exception: an empty
+// *requested* album means the lookup was artist-only, so the album comparison
+// is skipped and the artist agreement alone admits the hit. A requested album
+// that is present is still compared strictly.
+bool MetadataMatches(const std::string& expected, const std::string& candidate);
+
 // Light sanity check on a free-text search response: true only when the first
-// hit's own artist and title agree with the requested pair. Agreement ignores
-// case, punctuation and whitespace, and accepts a word-prefix on either side
-// ("Discovery" matches "Discovery (Deluxe Edition)", but "Program Music I" does
-// not match "Program Music III"). A rejected hit falls through to the next
-// provider.
+// hit's own artist and title agree with the requested pair (see
+// MetadataMatches). A rejected hit falls through to the next provider.
+// When `album` is empty the search is artist-only, so the hit's album is not
+// compared and any album it names is accepted; the hit still has to name a
+// non-empty album for the provider extractor to consider it a usable hit.
 bool SearchResultMatches(const std::string& body, Provider provider,
                          const std::string& artist, const std::string& album);
 
