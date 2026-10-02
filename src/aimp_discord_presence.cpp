@@ -193,6 +193,12 @@ bool AimpDiscordPresence::Load() {
   // cover is uploaded once and reused. Configuring it never touches the
   // network; an unusable path only costs the on-disk cache.
   CoverPublisher::Configure(ResolveCoverCachePath(settings.cover_cache));
+  // The permanent GitHub host. The token is handed to the publisher and lives
+  // only in memory from here on: it is never logged, never written into the
+  // cache, and sent only to api.github.com. An empty token simply leaves the
+  // GitHub host out of the list, so the chain behaves as it did before.
+  CoverPublisher::ConfigureAuth(Utils::ToString(settings.cover_token),
+                                Utils::ToString(settings.cover_repo));
   // Route the publisher's host-choice and all-hosts-failed lines into the same
   // DebugLog as the cover vocabulary.
   g_publisher_log_target = this;
@@ -228,6 +234,8 @@ void AimpDiscordPresence::LoadConfig() {
   LoadConfigValue(config, L"DiscordPresence\\UseAlbumArtOnline", &settings.use_albumart_online);
   LoadConfigValue(config, L"DiscordPresence\\LocalCover", &settings.local_cover);
   LoadConfigValue(config, L"DiscordPresence\\CoverCache", &settings.cover_cache);
+  LoadConfigValue(config, L"DiscordPresence\\CoverToken", &settings.cover_token);
+  LoadConfigValue(config, L"DiscordPresence\\CoverRepo", &settings.cover_repo);
   LoadConfigValue(config, L"DiscordPresence\\StatusDisplayType", &settings.status_display_type);
   LoadConfigValue(config, L"DiscordPresence\\DebugLog", &settings.debug_log);
   LoadConfigValue(config, L"DiscordPresence\\State.UsePlay", &settings.status.use_play);

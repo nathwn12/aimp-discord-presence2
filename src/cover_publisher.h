@@ -66,6 +66,13 @@ void SetLogger(void (*logger)(const std::string& line));
 // Reloads whatever the file already holds.
 void Configure(const std::string& cache_path);
 
+// Configures the permanent, user-owned GitHub host. `token` is a fine-grained
+// personal access token; when it is empty the GitHub host is skipped entirely
+// and the chain is exactly the keyless hosts. `repo` is "owner/name" and
+// defaults to nathwn12/aimp-discord-presence-art when empty. The token is
+// never logged, cached, or persisted - only its presence is ever named.
+void ConfigureAuth(const std::string& token, const std::string& repo);
+
 // Uploads image_bytes (mime names their type, e.g. "image/png") and returns the
 // public URL on success. On failure reason names the cause: "empty-body" when
 // the host answered HTTP 200 with an empty body, "http-<code>" for statuses

@@ -129,6 +129,12 @@ class AimpDiscordPresence :
     // cover-cache.txt next to the plugin DLL; a bare or relative name resolves
     // there as well, an absolute path is used as given.
     std::wstring cover_cache;
+    // Permanent, user-owned GitHub upload host. `cover_token` is a fine-grained
+    // personal access token; empty (the default) skips the GitHub host entirely.
+    // `cover_repo` is "owner/name" and defaults to the owner's art repo. The
+    // token is never logged, cached, or written anywhere by the plugin.
+    std::wstring cover_token;
+    std::wstring cover_repo = L"nathwn12/aimp-discord-presence-art";
     // What the member-list status line shows: 0 = name, 1 = state (album),
     // 2 = details (artist). Defaults to 2, the artist-first layout.
     int status_display_type = 2;

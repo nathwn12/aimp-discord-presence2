@@ -29,6 +29,9 @@ namespace {
 
 int g_checks = 0;
 int g_failures = 0;
+std::vector<std::string> g_log_lines;
+
+void CaptureLog(const std::string& line) { g_log_lines.push_back(line); }
 
 void Check(bool condition, const std::string& label) {
   ++g_checks;
@@ -266,28 +269,52 @@ void TestMultipartArithmetic() {
 // --- Upload host list: ordered, with each host's own shape ------------------
 
 void TestHostList() {
-  Check(kUploadHostCount == 2, "host list has exactly two hosts");
-  Check(ConfiguredHostCount() == 2, "configured host count matches");
+  // Without a token the chain is the keyless one, unchanged in order and size.
+  CoverPublisher::ConfigureAuth("", "");
+  Check(ConfiguredHostCount() == 3, "host list has exactly three keyless hosts without a token");
+  Check(kBaseUploadHostCount == 3, "the keyless host count constant is three");
+  Check(ConfiguredHostName(0) == "catbox.moe",
+        "host 0 without a token is catbox - permanent and first keyless");
+  Check(ConfiguredHostName(1) == "uguu.se",
+        "host 1 without a token is uguu - the measured working host");
+  Check(ConfiguredHostName(2) == "litter.catbox.moe",
+        "host 2 without a token is litterbox - last as a dormant fallback");
+  Check(ConfiguredHostName(3).empty(), "an out-of-range host name is empty");
 
-  // Order is the fallback order, working host first: uguu (measured working
-  // from here) then litterbox (dormant - a WAF 403s it on this network, so it
-  // is never reached when uguu succeeds, but it costs nothing to keep last).
-  // A host failure moves down the list, never to a different layer.
-  Check(std::string(ConfiguredHostName(0)) == "uguu.se",
-        "host 0 is uguu - the working host is tried first");
-  Check(std::string(ConfiguredHostName(1)) == "litter.catbox.moe",
-        "host 1 is litterbox - kept last as a dormant fallback");
-  Check(ConfiguredHostName(2)[0] == '\0', "an out-of-range host name is empty");
+  bool github_absent = true;
+  for (size_t i = 0; i < ConfiguredHostCount(); ++i) {
+    github_absent = github_absent && ConfiguredHostName(i) != "github.com";
+  }
+  Check(github_absent, "an empty token omits the GitHub host entirely");
 
-  // Each entry carries its own endpoint and multipart shape.
-  Check(std::wstring(kUploadHosts[0].host) == L"uguu.se" &&
-            std::wstring(kUploadHosts[0].path) == L"/upload?output=text" &&
-            kUploadHosts[0].shape == UploadShape::kUguu,
+  // Each keyless entry carries its own endpoint and multipart shape.
+  Check(std::wstring(kBaseUploadHosts[0].host) == L"catbox.moe" &&
+            std::wstring(kBaseUploadHosts[0].path) == L"/user/api.php" &&
+            kBaseUploadHosts[0].shape == UploadShape::kCatbox,
+        "catbox owns its endpoint and reqtype/fileToUpload shape");
+  Check(std::wstring(kBaseUploadHosts[1].host) == L"uguu.se" &&
+            std::wstring(kBaseUploadHosts[1].path) == L"/upload?output=text" &&
+            kBaseUploadHosts[1].shape == UploadShape::kUguu,
         "uguu owns its endpoint and files[] shape");
-  Check(std::wstring(kUploadHosts[1].host) == L"litterbox.catbox.moe" &&
-            std::wstring(kUploadHosts[1].path) == L"/resources/internals/api.php" &&
-            kUploadHosts[1].shape == UploadShape::kLitterbox,
+  Check(std::wstring(kBaseUploadHosts[2].host) == L"litterbox.catbox.moe" &&
+            std::wstring(kBaseUploadHosts[2].path) == L"/resources/internals/api.php" &&
+            kBaseUploadHosts[2].shape == UploadShape::kLitterbox,
         "litterbox owns its endpoint and fileToUpload shape");
+
+  // A configured token prepends the GitHub host: github -> catbox -> uguu ->
+  // litterbox, with no other entry reordered.
+  CoverPublisher::ConfigureAuth("test-token", "");
+  Check(ConfiguredHostCount() == 4, "a configured token adds exactly one host");
+  Check(ConfiguredHostName(0) == "github.com",
+        "the GitHub host is FIRST when a token is configured");
+  Check(ConfiguredHostName(1) == "catbox.moe", "catbox stays second when GitHub is present");
+  Check(ConfiguredHostName(2) == "uguu.se", "uguu stays third when GitHub is present");
+  Check(ConfiguredHostName(3) == "litter.catbox.moe",
+        "litterbox stays last when GitHub is present");
+
+  // Restore the no-token default so the later tests still see the keyless chain.
+  CoverPublisher::ConfigureAuth("", "");
+  Check(ConfiguredHostCount() == 3, "clearing the token restores the keyless chain");
 }
 
 // --- Multipart shapes differ correctly per host ----------------------------
@@ -331,6 +358,262 @@ void TestMultipartShapes() {
   // The image bytes still land exactly once in each body.
   Check(uguu.find(std::string(64, 0x2a)) != std::string::npos,
         "uguu body carries the image bytes");
+}
+
+// --- Centre-square crop -----------------------------------------------------
+
+void TestCentreSquareCrop() {
+  // The re-encode crops to the shorter side, then caps at 512: 1000x800 becomes
+  // an 800 square, capped to 512.
+  const CompressionPlan wide = PlanCompression(1000, 800, 5 * 1024 * 1024);
+  Check(wide.reencode && wide.width == 512 && wide.height == 512,
+        "1000x800 -> an 800 square capped at 512");
+  Check(wide.width == wide.height, "the compression plan is always square");
+
+  const CompressionPlan tall = PlanCompression(400, 900, 4 * 1024 * 1024);
+  Check(tall.reencode && tall.width == 400 && tall.height == 400,
+        "a 400x900 portrait crops to a 400 square (shorter side under 512)");
+
+  // The skip rule is unchanged: a source already square, at or below 512 px and
+  // at most 256 KB, is not re-encoded.
+  const CompressionPlan already_square = PlanCompression(512, 512, 100 * 1024);
+  Check(!already_square.reencode,
+        "an already-square image <=512 px and <=256 KB is NOT re-encoded");
+  const CompressionPlan square_heavy = PlanCompression(512, 512, 300 * 1024);
+  Check(square_heavy.reencode && square_heavy.width == 512 && square_heavy.height == 512,
+        "an already-square image over 256 KB re-encodes in place at 512");
+}
+
+// --- GitHub host configuration ----------------------------------------------
+
+void TestGitHubHostConfig() {
+  CoverPublisher::ConfigureAuth("", "");
+  Check(ConfiguredHostCount() == 3, "github config: no token -> the keyless chain");
+
+  CoverPublisher::ConfigureAuth("test-token", "octo/art");
+  Check(ConfiguredHostCount() == 4, "github config: token + repo -> GitHub added");
+  Check(ConfiguredHostName(0) == "github.com", "github config: GitHub is first");
+
+  // A malformed repo skips GitHub rather than building a nonsense target.
+  CoverPublisher::ConfigureAuth("test-token", "no-slash-here");
+  Check(ConfiguredHostCount() == 3, "github config: a malformed repo has no GitHub host");
+
+  // An empty repo falls back to the default owner/name.
+  CoverPublisher::ConfigureAuth("test-token", "");
+  Check(ConfiguredHostCount() == 4, "github config: an empty repo uses the default repo");
+
+  CoverPublisher::ConfigureAuth("", "");
+}
+
+// --- GitHub request shape ---------------------------------------------------
+
+void TestGitHubRequestShape() {
+  const std::string token = "test-token";
+  const std::wstring owner = L"octo";
+  const std::wstring repo = L"art";
+  const std::string name = Sha256Hex(std::vector<unsigned char>{'c', 'o', 'v', 'e', 'r'});
+  const std::vector<unsigned char> image = {'a', 'b', 'c'};
+  const GitHubRequest request = BuildGitHubRequest(token, owner, repo, name, image);
+
+  Check(request.method == L"PUT", "github request is a PUT");
+  Check(request.host == L"api.github.com", "github request targets api.github.com");
+  const std::wstring expected_path =
+      L"/repos/octo/art/contents/covers/" + Utils::ToWString(name) + L".jpg";
+  Check(request.path == expected_path,
+        "github request path is /repos/<owner>/<repo>/contents/covers/<sha>.jpg");
+  Check(request.headers.find(L"Authorization: Bearer test-token") != std::wstring::npos,
+        "github request carries the bearer token");
+  Check(request.headers.find(L"Content-Type: application/json") != std::wstring::npos,
+        "github request announces a JSON body");
+
+  // The token is confined to the Authorization header: never in the target or
+  // the body.
+  Check(request.path.find(L"test-token") == std::wstring::npos,
+        "the token is not in the request target");
+  Check(request.body.find("test-token") == std::string::npos,
+        "the token is not in the JSON body");
+  Check(request.body.find("\"branch\":\"main\"") != std::string::npos,
+        "github body commits to the main branch");
+  Check(request.body.find("\"content\":\"") != std::string::npos,
+        "github body carries base64 content");
+  Check(request.body.find(name.substr(0, 7)) != std::string::npos,
+        "github commit message names the cover by its short hash");
+
+  Check(Base64Encode(reinterpret_cast<const unsigned char*>("abc"), 3) == "YWJj",
+        "base64 abc known answer");
+
+  // No other host's request carries an Authorization header: the multipart
+  // bodies (the only other payloads) never contain one.
+  const std::string boundary = "----authtest";
+  const std::string catbox = BuildMultipartBody(boundary, "image/png", image, UploadShape::kCatbox);
+  const std::string uguu = BuildMultipartBody(boundary, "image/png", image, UploadShape::kUguu);
+  const std::string litterbox =
+      BuildMultipartBody(boundary, "image/png", image, UploadShape::kLitterbox);
+  Check(catbox.find("Authorization") == std::string::npos &&
+            uguu.find("Authorization") == std::string::npos &&
+            litterbox.find("Authorization") == std::string::npos,
+        "only the GitHub host carries an Authorization header");
+}
+
+// --- GitHub contents response classification --------------------------------
+
+void TestGitHubResponseClassification() {
+  const std::wstring owner = L"nwhn12";
+  const std::wstring repo = L"aimp-discord-presence-art";
+  const std::string name = Sha256Hex(std::vector<unsigned char>{'c', 'o', 'v', 'e', 'r'});
+  const std::string download =
+      "https://raw.githubusercontent.com/nwhn12/aimp-discord-presence-art/main/covers/" + name +
+      ".jpg";
+
+  // 201/200 success: the url is content.download_url, never the raw JSON.
+  const std::string ok_body =
+      "{\"content\":{\"name\":\"" + name + ".jpg\",\"download_url\":\"" + download +
+      "\"},\"commit\":{\"sha\":\"deadbeef\"}}";
+  const Result created = ClassifyGitHubResponse(201, ok_body, owner, repo, name);
+  Check(created.ok && created.url == download,
+        "github 201 + download_url -> success with THAT url");
+  const Result ok200 = ClassifyGitHubResponse(200, ok_body, owner, repo, name);
+  Check(ok200.ok && ok200.url == download, "github 200 + download_url -> success with THAT url");
+  Check(created.url != ok_body, "the raw JSON body is never returned as the url");
+
+  // No download_url -> failure, never a url.
+  const std::string no_download = "{\"content\":{\"name\":\"" + name + ".jpg\"},\"commit\":{}}";
+  const Result missing = ClassifyGitHubResponse(200, no_download, owner, repo, name);
+  Check(!missing.ok && missing.url.empty(), "a JSON body without download_url is a failure");
+  Check(missing.reason.find("200") != std::string::npos,
+        "the missing-download_url failure names the status");
+
+  // A download_url on another owner/repo is rejected (owner/repo are pinned).
+  const std::string foreign =
+      "{\"content\":{\"download_url\":\"https://raw.githubusercontent.com/evil/art/main/covers/" +
+      name + ".jpg\"}}";
+  const Result foreign_result = ClassifyGitHubResponse(200, foreign, owner, repo, name);
+  Check(!foreign_result.ok, "a download_url for another owner/repo is rejected");
+
+  // A bare (non-JSON) body that happens to be a url is never adopted.
+  const Result bare = ClassifyGitHubResponse(200, download, owner, repo, name);
+  Check(!bare.ok, "a bare url body is not parsed as a download_url");
+
+  // The immutable file already exists: 422/409 -> success via the raw URL.
+  const std::string raw = GitHubRawUrl(owner, repo, name);
+  const Result exists422 =
+      ClassifyGitHubResponse(422, "{\"message\":\"already exists\"}", owner, repo, name);
+  Check(exists422.ok && exists422.url == raw,
+        "github 422 -> success via the constructed raw url");
+  const Result exists409 = ClassifyGitHubResponse(409, "", owner, repo, name);
+  Check(exists409.ok && exists409.url == raw,
+        "github 409 -> success via the constructed raw url");
+
+  // Bad auth: failure named by status only; the body is never echoed.
+  const Result unauthorized =
+      ClassifyGitHubResponse(401, "{\"message\":\"Bad credentials test-token\"}", owner, repo, name);
+  Check(!unauthorized.ok && unauthorized.reason == "http-401",
+        "github 401 -> failure named by status");
+  Check(unauthorized.reason.find("test-token") == std::string::npos && unauthorized.url.empty(),
+        "a 401 never leaks the body or the token into the result");
+  const Result forbidden = ClassifyGitHubResponse(403, "rate limited test-token", owner, repo, name);
+  Check(!forbidden.ok && forbidden.reason == "http-403",
+        "github 403 -> failure named by status");
+  Check(forbidden.reason.find("test-token") == std::string::npos,
+        "a 403 never leaks the token into the reason");
+
+  Check(created.url.find("test-token") == std::string::npos,
+        "the success url never contains the token");
+}
+
+// --- catbox host ------------------------------------------------------------
+
+void TestCatboxHost() {
+  Check(std::wstring(kBaseUploadHosts[0].host) == L"catbox.moe" &&
+            std::wstring(kBaseUploadHosts[0].path) == L"/user/api.php" &&
+            kBaseUploadHosts[0].shape == UploadShape::kCatbox,
+        "catbox owns its endpoint and shape");
+
+  const std::vector<unsigned char> image(32, 0x11);
+  const std::string boundary = "----catboxtest";
+  const std::string body = BuildMultipartBody(boundary, "image/png", image, UploadShape::kCatbox);
+  Check(body.find("name=\"reqtype\"") != std::string::npos, "catbox carries reqtype");
+  Check(body.find("name=\"fileToUpload\"") != std::string::npos,
+        "catbox carries fileToUpload");
+  Check(body.find("name=\"time\"") == std::string::npos,
+        "catbox has no time field (it stores permanently)");
+  Check(body.find("name=\"files[]\"") == std::string::npos,
+        "catbox never uses the uguu field name");
+  Check(body.find("fileupload\r\n") != std::string::npos, "catbox reqtype value is fileupload");
+  Check(body.find("filename=\"cover.png\"") != std::string::npos,
+        "catbox file part carries a filename");
+
+  const std::string catbox_url = "https://files.catbox.moe/a1b2c3.png";
+  const Result ok = ClassifyUploadResponse(200, catbox_url, UploadShape::kCatbox);
+  Check(ok.ok && ok.url == catbox_url, "catbox 200 + bare url -> success");
+  const Result trimmed = ClassifyUploadResponse(200, catbox_url + "\r\n", UploadShape::kCatbox);
+  Check(trimmed.ok && trimmed.url == catbox_url, "catbox url with a newline is trimmed");
+  const Result wrong_host =
+      ClassifyUploadResponse(200, "https://litter.catbox.moe/abc123.png", UploadShape::kCatbox);
+  Check(!wrong_host.ok, "a litterbox url is not accepted for the catbox host");
+  Check(LooksLikeUploadUrl(catbox_url), "the catbox url is a recognised upload url");
+}
+
+// --- The token never leaks --------------------------------------------------
+
+void TestTokenNeverLeaks() {
+  const std::string token = "test-token";
+  const std::wstring owner = L"nwhn12";
+  const std::wstring repo = L"aimp-discord-presence-art";
+  const std::string name = Sha256Hex(std::vector<unsigned char>{'l', 'o', 'g'});
+
+  g_log_lines.clear();
+  CoverPublisher::SetLogger(CaptureLog);
+
+  // Positive control: the recorder is live before we conclude anything from its
+  // silence, and an empty token is logged as a state, never a value.
+  CoverPublisher::ConfigureAuth("", "");
+  LogGitHubAuthState();
+  Check(!g_log_lines.empty(), "the log recorder is live (positive control)");
+  Check(g_log_lines.back().find("auth=absent") != std::string::npos,
+        "an empty token logs auth=absent, never a value");
+
+  // With a token, only its presence is named.
+  CoverPublisher::ConfigureAuth(token, "");
+  LogGitHubAuthState();
+  LogGitHubAuthRejected("403");
+  const Result rejected =
+      ClassifyGitHubResponse(401, "{\"message\":\"" + token + "\"}", owner, repo, name);
+  PreparedImage prepared;
+  LogHostFailure(rejected.reason, HostListToken(), 2, prepared);
+  CoverPublisher::SetLogger(nullptr);
+
+  bool token_in_log = false;
+  for (const std::string& line : g_log_lines) {
+    token_in_log = token_in_log || line.find(token) != std::string::npos;
+  }
+  Check(g_log_lines.size() >= 3,
+        "the auth-state, auth-rejected and failure lines were all recorded");
+  Check(!token_in_log, "no log line contains the token");
+  Check(rejected.reason.find(token) == std::string::npos && rejected.url.empty(),
+        "the result carries neither the token nor the body");
+  Check(HostListToken().find(token) == std::string::npos,
+        "the host-list token names hosts only, never the access token");
+
+  CoverPublisher::ConfigureAuth("", "");
+}
+
+// --- The four-layer order is unchanged by the host chain --------------------
+
+void TestHostFailureDoesNotSkipLayers() {
+  using PresenceLayout::CoverLayer;
+  using PresenceLayout::ResolveCoverLayer;
+
+  const std::string online =
+      "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
+  const Result none = ClassifyUploadResponse(403, "");
+  Check(!none.ok, "an all-hosts failure leaves no local url");
+  Check(ResolveCoverLayer("", "", online) == CoverLayer::kOnlineKeyless,
+        "four-layer order: a failed local publish still descends to online");
+  Check(ResolveCoverLayer("", "", online) != CoverLayer::kBlackPng,
+        "four-layer order: black is not used while online resolved");
+  Check(ResolveCoverLayer("", "", "") == CoverLayer::kBlackPng,
+        "four-layer order: black is reachable only when embedded, sidecar and online all fail");
 }
 
 void TestBoundary() {
@@ -765,27 +1048,32 @@ void TestSha256() {
 // --- Compression decision ---------------------------------------------------
 
 void TestCompressionPlan() {
+  // The re-encode is a 512 px centre-square: crop to the shorter side first,
+  // then cap that square at 512. Aspect is intentionally NOT preserved.
   const CompressionPlan large = PlanCompression(2000, 1500, 5 * 1024 * 1024);
   Check(large.reencode, "large image is re-encoded");
-  Check(large.width == 600 && large.height == 450, "longest side clamps to 600 with aspect preserved");
+  Check(large.width == 512 && large.height == 512,
+        "2000x1500 crops to a 1500 square, capped at 512");
 
   const CompressionPlan portrait = PlanCompression(900, 2400, 400 * 1024);
   Check(portrait.reencode, "portrait image is re-encoded");
-  Check(portrait.width == 225 && portrait.height == 600, "portrait long side clamps to 600");
+  Check(portrait.width == 512 && portrait.height == 512,
+        "900x2400 crops to a 900 square, capped at 512");
 
   const CompressionPlan already_small = PlanCompression(320, 240, 100 * 1024);
-  Check(!already_small.reencode, "image at or below 600 px and 256 KB skips re-encoding");
+  Check(!already_small.reencode, "image at or below 512 px and 256 KB skips re-encoding");
 
-  const CompressionPlan at_bound = PlanCompression(600, 600, 256 * 1024);
-  Check(!at_bound.reencode, "the 600 px / 256 KB boundary is still 'already small'");
+  const CompressionPlan at_bound = PlanCompression(512, 512, 256 * 1024);
+  Check(!at_bound.reencode, "the 512 px / 256 KB boundary is still 'already small'");
 
   const CompressionPlan heavy = PlanCompression(320, 240, 300 * 1024);
   Check(heavy.reencode, "small dimensions but heavy bytes are re-encoded");
-  Check(heavy.width == 320 && heavy.height == 240, "an in-place re-encode never upscales");
+  Check(heavy.width == 240 && heavy.height == 240,
+        "a 320x240 in-place crop uses the shorter side and never upscales");
 
   const CompressionPlan just_over = PlanCompression(601, 600, 100 * 1024);
-  Check(just_over.reencode && just_over.width == 600 && just_over.height == 599,
-        "601 px on the longest side is scaled under the bound");
+  Check(just_over.reencode && just_over.width == 512 && just_over.height == 512,
+        "601 px on the longest side is scaled under the 512 bound");
 
   const CompressionPlan unknown = PlanCompression(0, 0, 1024);
   Check(!unknown.reencode && unknown.width == 0 && unknown.height == 0, "unknown dimensions are left alone");
@@ -953,7 +1241,7 @@ void TestCompressionPreparation() {
   UINT width = 0;
   UINT height = 0;
   Check(DecodeTestDimensions(prepared.bytes, &width, &height), "re-encoded bytes decode");
-  Check(width == 600 && height == 375, "longest side is exactly 600 and aspect is preserved");
+  Check(width == 512 && height == 512, "the re-encode is a 512 px centre square");
 
   const std::vector<unsigned char> compact = EncodeTestPng(320, 240, false);
   Check(!compact.empty() && compact.size() <= kSkipReencodeMaxBytes, "fixture is already small");
@@ -1171,6 +1459,13 @@ int main(int argc, char** argv) {
   TestMultipartArithmetic();
   TestHostList();
   TestMultipartShapes();
+  TestCentreSquareCrop();
+  TestGitHubHostConfig();
+  TestGitHubRequestShape();
+  TestGitHubResponseClassification();
+  TestCatboxHost();
+  TestTokenNeverLeaks();
+  TestHostFailureDoesNotSkipLayers();
   TestBoundary();
   TestAlbumIdentityKeys();
   TestCoverFallbackChain();

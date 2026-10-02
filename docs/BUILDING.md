@@ -84,7 +84,8 @@ find the Profile folder location in AIMP's settings.)
 | `Timestamp` | bool | Show playback timestamps. `0` = elapsed time, `1` = remaining time. |
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
 | `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the black fallback image. `1` = allow online lookups. |
-| `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
+| `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. The local image is uploaded through a host chain - GitHub (only when `CoverToken` is set), catbox, uguu, then litterbox - and a host failure falls through to the online lookup, never straight to black. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
+| `CoverToken`, `CoverRepo` | string, string | **Optional** permanent GitHub upload host. `CoverToken` is a fine-grained personal access token with `contents: write` for the repository. An **empty token (the default) is fine**: it simply omits the GitHub host, and the keyless hosts handle the upload with no behaviour change. When set, GitHub is tried first, and the token is sent **only** to `api.github.com`; it is never logged, printed, or written to `CoverCache`. `CoverRepo`: the `owner/name` repository that receives the covers; empty (the default) uses `nathwn12/aimp-discord-presence-art`. |
 | `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **song title** (the `state` line), `2` = **artist** (default). |
 | `DebugLog` | string | Optional file that receives the Discord IPC frame log, for diagnosing connection problems. Empty (the default) disables it. A bare filename is written next to the plugin DLL; an absolute path is used as given. |
 | `State.UsePlay` | bool | Show a small play badge. `0` = off, `1` = on. |
@@ -109,6 +110,12 @@ UseAlbumArt=1
 
 ; Allow network album-art lookups (Deezer, then iTunes, then MusicBrainz). 0 = always use the offline asset. Default: 1
 UseAlbumArtOnline=1
+
+; Optional permanent GitHub cover host. Leave CoverToken empty for the default
+; keyless chain; the token is sent only to api.github.com and is never logged or
+; cached. CoverRepo defaults to the owner's art repository.
+CoverToken=
+CoverRepo=nathwn12/aimp-discord-presence-art
 
 ; Member-list status text: 0 = app name / 1 = song title / 2 = artist. Default: 2
 StatusDisplayType=2

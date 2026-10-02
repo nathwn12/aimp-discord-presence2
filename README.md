@@ -12,22 +12,31 @@ switch tracks, Discord updates with the artist, the song, the album artwork, and
 
 ## Artwork
 
-The plugin looks for cover art in three steps, and stops at the first one that
-works:
+The plugin resolves cover art through four layers, and stops at the first one
+that yields a usable image:
 
-1. **The artwork in your file.** Embedded tags and sidecar images come first, so
-   the cover you already have is the cover Discord shows. AIMP's own providers
-   are asked first; if they find nothing, the plugin looks for a conventional
-   cover file (`cover`, `folder`, `front`, `album`, `albumart`, or Windows Media
-   Player's `AlbumArtSmall`/`AlbumArt_{GUID}_Large`) in the track's folder and
-   up to four folders above it, so a multi-disc album whose art sits at the
-   album level still shows its cover. Cover files are read, never decoded or
-   rewritten.
-2. **A keyless online lookup.** If the file has no artwork, the plugin asks a few
-   public music services for the cover. No accounts and no API keys are
-   involved, and you can turn this step off in the config.
-3. **A plain black placeholder.** If nothing is found, or online lookups are
+1. **The art embedded in your file.** AIMP's own providers are asked first, so
+   the cover you already have is the cover Discord shows.
+2. **A sidecar image.** If the tags carry no art, the plugin looks for a
+   conventional cover file (`cover`, `folder`, `front`, `album`, `albumart`, or
+   Windows Media Player's `AlbumArtSmall`/`AlbumArt_{GUID}_Large`) in the track's
+   folder and up to four folders above it, so a multi-disc album whose art sits
+   at the album level still shows its cover. Cover files are read, never decoded
+   or rewritten.
+3. **A keyless online lookup.** If neither local layer produced art, the plugin
+   asks a few public music services for the cover. No accounts and no API keys
+   are involved, and you can turn this step off in the config.
+4. **A plain black placeholder.** If nothing is found, or online lookups are
    disabled, the card gets a solid black image rather than an empty one.
+
+The two local layers (embedded art and sidecar) publish the image through a
+small upload-host chain so Discord can fetch it: an optional GitHub repository
+you own, then catbox, uguu, and litterbox. The GitHub host is used only when you
+set `CoverToken` in the config; with an empty token it is omitted and the
+keyless hosts handle the upload. The upload hosts are all inside the local
+layers - a host failure still falls through to the online lookup, never straight
+to black. Every key, including `CoverToken` and `CoverRepo`, is documented in
+[docs/BUILDING.md](docs/BUILDING.md).
 
 ## What you get
 

@@ -71,24 +71,38 @@ constexpr long long kNegativeCacheTtlSeconds = 60;
 // matching the live measurement of the host's request framing.
 constexpr size_t kBoundaryLength = 29;
 
-// Cover transfer shaping: the longest side is scaled down to at most 600 px and
-// the result is encoded as JPEG q85, unless the source is already both at or
-// below 600 px and at most 256 KB, in which case it goes up untouched.
-constexpr UINT kMaxImageDimension = 600;
+// Cover transfer shaping: the image is centre-cropped to a square (the shorter
+// side) and then scaled down to at most 512 px - Discord re-crops every large
+// image to a centre square anyway, so cropping here keeps the payload small and
+// correctly framed. The result is encoded as JPEG q85, unless the source is
+// already both at or below 512 px and at most 256 KB, in which case it goes up
+// untouched (the existing skip rule).
+constexpr UINT kMaxImageDimension = 512;
 constexpr size_t kSkipReencodeMaxBytes = 256 * 1024;
 constexpr float kJpegQuality = 0.85f;
 
+// The GitHub contents response carries a base64 `content` object and can run to
+// a few hundred KB; the keyless hosts answer in bytes, so the larger limit
+// applies to the GitHub request only.
+constexpr size_t kMaxGitHubResponseBytes = 1024 * 1024;
+
 constexpr wchar_t kAgentName[] = L"AIMP-Discord-Presence/2.0";
 
-// Upload hosts are tried in order until one returns a usable URL. The order is
-// the whole point: uguu.se is FIRST because it is the host measured working from
-// here, so the common path never pays for a dead host; litter.catbox.moe is kept
-// LAST as a dormant fallback - it answers HTTP 403 to a BunkerWeb WAF on this
-// network, so it is never reached when uguu succeeds, but it may still serve
-// other networks and other users of this plugin. A host that fails costs its
-// round trip only, and never skips a layer of the cover chain.
-// Each host owns both its endpoint and the shape of the multipart body.
+// Upload hosts are tried in order until one returns a usable URL. GitHub, when
+// a token is configured, is FIRST because it is the owner's own permanent repo;
+// catbox.moe is a permanent keyless host; uguu.se is the host measured working
+// from this network; litter.catbox.moe is kept LAST as a dormant fallback - it
+// answers HTTP 403 to a BunkerWeb WAF here, so it is never reached when an
+// earlier host succeeds, but it may still serve other networks. A host that
+// fails costs its round trip only, and never skips a layer of the cover chain.
+// Each host owns both its endpoint and the shape of its request body.
 enum class UploadShape {
+  // GitHub: PUT /repos/{owner}/{repo}/contents/covers/{name}.jpg with a JSON
+  // body (base64 image). The response is JSON; the URL is content.download_url.
+  kGitHub,
+  // catbox: POST /user/api.php with reqtype=fileupload and the image in
+  // `fileToUpload`. The response body is the bare URL as text.
+  kCatbox,
   // uguu: POST /upload?output=text with no extra fields and the image in
   // `files[]`. The response body is the bare URL as text.
   kUguu,
@@ -98,36 +112,75 @@ enum class UploadShape {
 };
 
 struct UploadHost {
-  const wchar_t* name;   // log marker, e.g. "litter.catbox.moe"
-  const wchar_t* host;   // for WinHttpConnect
-  const wchar_t* path;   // request target, query string included
+  std::wstring name;   // log marker, e.g. "litter.catbox.moe"
+  std::wstring host;   // for WinHttpConnect
+  std::wstring path;   // request target, query string included
   UploadShape shape;
 };
 
 // The log marker as UTF-8, so it can be concatenated into a std::string line.
 std::string HostNameUtf8(const UploadHost& upload_host) {
-  if (upload_host.name == nullptr) {
-    return std::string();
-  }
-  const int needed = WideCharToMultiByte(CP_UTF8, 0, upload_host.name, -1, nullptr, 0, nullptr,
-                                         nullptr);
-  if (needed <= 1) {
-    return std::string();
-  }
-  std::string out(static_cast<size_t>(needed - 1), '\0');
-  WideCharToMultiByte(CP_UTF8, 0, upload_host.name, -1, out.data(), needed, nullptr, nullptr);
-  return out;
+  return Utils::ToString(upload_host.name);
 }
 
-constexpr size_t kUploadHostCount = 2;
-constexpr UploadHost kUploadHosts[kUploadHostCount] = {
+// The keyless hosts, always present and always in this order: catbox, then
+// uguu, then the dormant litterbox. The GitHub host, when configured, is
+// prepended to these by ActiveHosts().
+const size_t kBaseUploadHostCount = 3;
+const UploadHost kBaseUploadHosts[kBaseUploadHostCount] = {
+    {L"catbox.moe", L"catbox.moe", L"/user/api.php", UploadShape::kCatbox},
     {L"uguu.se", L"uguu.se", L"/upload?output=text", UploadShape::kUguu},
     {L"litter.catbox.moe", L"litterbox.catbox.moe", L"/resources/internals/api.php", UploadShape::kLitterbox},
 };
 
-// The log markers as narrow strings, index-parallel to kUploadHosts, so a
-// caller can name a host without a UTF-8 conversion at each use.
-constexpr const char* kUploadHostNames[kUploadHostCount] = {"uguu.se", "litter.catbox.moe"};
+// The default GitHub repository: the owner's permanent art repo. CoverRepo
+// overrides it; CoverToken (empty by default) enables the host at all.
+const wchar_t kDefaultGitHubRepo[] = L"nathwn12/aimp-discord-presence-art";
+
+// The GitHub host configuration. `token` is only ever sent to api.github.com;
+// it is never logged, cached, or put into a Result. Guarded by g_host_mutex
+// because ConfigureAuth runs before the publisher worker starts, but the worker
+// reads it for each publish.
+std::mutex g_host_mutex;
+std::string g_github_token;
+std::wstring g_github_owner;
+std::wstring g_github_repo;
+
+// Splits "owner/name" into its two parts. A malformed value yields false, which
+// skips the GitHub host rather than building a nonsense request target.
+bool ParseOwnerRepo(const std::wstring& repo, std::wstring* owner, std::wstring* name) {
+  const size_t slash = repo.find(L'/');
+  if (slash == std::wstring::npos || slash == 0 || slash + 1 >= repo.size()) {
+    return false;
+  }
+  *owner = repo.substr(0, slash);
+  *name = repo.substr(slash + 1);
+  return name->find(L'/') == std::wstring::npos;
+}
+
+// Every host to try, in order. GitHub first only when a token and a parseable
+// repo are configured; the keyless hosts otherwise (unchanged chain).
+std::vector<UploadHost> ActiveHosts() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  std::vector<UploadHost> hosts;
+  if (!g_github_token.empty() && !g_github_owner.empty() && !g_github_repo.empty()) {
+    UploadHost github;
+    github.name = L"github.com";
+    github.host = L"api.github.com";
+    github.path = L"/repos/" + g_github_owner + L"/" + g_github_repo + L"/contents/covers/";
+    github.shape = UploadShape::kGitHub;
+    hosts.push_back(github);
+  }
+  for (size_t i = 0; i < kBaseUploadHostCount; ++i) {
+    hosts.push_back(kBaseUploadHosts[i]);
+  }
+  return hosts;
+}
+
+bool GitHubTokenPresent() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  return !g_github_token.empty();
+}
 
 // Each host owns the exact URL shape it answers with, so a lookalike host
 // ("...moe.evil.test") or a body that is not that host's URL is rejected. The
@@ -138,11 +191,25 @@ constexpr const char* kUploadHostNames[kUploadHostCount] = {"uguu.se", "litter.c
 // rejected real responses as "unexpected body".
 constexpr char kLitterboxUrlPattern[] = R"(^https://litter\.catbox\.moe/[a-z0-9]{6}\.(png|jpg|jpeg)$)";
 constexpr char kUguuUrlPattern[] = R"(^https://([A-Za-z0-9-]+\.)?uguu\.se/[A-Za-z0-9]+\.(png|jpg|jpeg|gif|webp|bmp)$)";
+constexpr char kCatboxUrlPattern[] = R"(^https://files\.catbox\.moe/[A-Za-z0-9]+\.(png|jpg|jpeg|gif|webp|bmp)$)";
+// A GitHub raw cover URL, generic over owner/repo so the cache can validate a
+// stored URL; the per-request classifier pins the exact owner and repo.
+constexpr char kGitHubRawUrlPattern[] =
+    R"(^https://raw\.githubusercontent\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/main/covers/[0-9a-f]{64}\.jpg$)";
 // Fallback when no host is specified (kept for callers that classify a bare
 // response): the strict litterbox shape.
 std::string UploadUrlPatternFor(const UploadHost& upload_host) {
-  return upload_host.shape == UploadShape::kUguu ? std::string(kUguuUrlPattern)
-                                                 : std::string(kLitterboxUrlPattern);
+  switch (upload_host.shape) {
+    case UploadShape::kCatbox:
+      return std::string(kCatboxUrlPattern);
+    case UploadShape::kUguu:
+      return std::string(kUguuUrlPattern);
+    case UploadShape::kGitHub:
+      return std::string(kGitHubRawUrlPattern);
+    case UploadShape::kLitterbox:
+    default:
+      return std::string(kLitterboxUrlPattern);
+  }
 }
 constexpr char kMimePattern[] = R"(^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$)";
 
@@ -168,17 +235,23 @@ std::string TrimWhitespace(const std::string& text) {
 bool LooksLikeUploadUrl(const std::string& text) {
   static const std::regex litterbox_pattern(kLitterboxUrlPattern);
   static const std::regex uguu_pattern(kUguuUrlPattern);
-  return std::regex_match(text, litterbox_pattern) || std::regex_match(text, uguu_pattern);
+  static const std::regex catbox_pattern(kCatboxUrlPattern);
+  static const std::regex github_pattern(kGitHubRawUrlPattern);
+  return std::regex_match(text, litterbox_pattern) || std::regex_match(text, uguu_pattern) ||
+         std::regex_match(text, catbox_pattern) || std::regex_match(text, github_pattern);
 }
 
 // The per-host predicate used by the classifier: a 200 is a success only when
-// the body is the bare URL of the host that answered.
+// the body is the bare URL of the host that answered. GitHub never uses this
+// form (its response is JSON, validated with its own owner/repo pin), so its
+// pattern here is the generic raw-URL shape.
 bool LooksLikeHostUrl(const std::string& text, const UploadHost& upload_host) {
-  const char* url_pattern =
-      upload_host.shape == UploadShape::kUguu ? kUguuUrlPattern : kLitterboxUrlPattern;
+  const std::string url_pattern = UploadUrlPatternFor(upload_host);
   static const std::map<std::string, std::regex> patterns = {
       {kLitterboxUrlPattern, std::regex(kLitterboxUrlPattern)},
       {kUguuUrlPattern, std::regex(kUguuUrlPattern)},
+      {kCatboxUrlPattern, std::regex(kCatboxUrlPattern)},
+      {kGitHubRawUrlPattern, std::regex(kGitHubRawUrlPattern)},
   };
   const auto found = patterns.find(url_pattern);
   return found != patterns.end() && std::regex_match(text, found->second);
@@ -226,6 +299,14 @@ std::string MultipartPrefix(const std::string& boundary, const std::string& mime
     prefix += delimiter;
     prefix += "Content-Disposition: form-data; name=\"time\"\r\n\r\n";
     prefix += "72h\r\n";
+    prefix += delimiter;
+    prefix += "Content-Disposition: form-data; name=\"fileToUpload\"; filename=\"";
+  } else if (shape == UploadShape::kCatbox) {
+    // Two parts: reqtype, then the file in `fileToUpload`. Catbox stores
+    // permanently, so unlike litterbox there is no time field.
+    prefix += delimiter;
+    prefix += "Content-Disposition: form-data; name=\"reqtype\"\r\n\r\n";
+    prefix += "fileupload\r\n";
     prefix += delimiter;
     prefix += "Content-Disposition: form-data; name=\"fileToUpload\"; filename=\"";
   } else {
@@ -291,6 +372,157 @@ Result ClassifyUploadResponse(DWORD status, const std::string& body,
   if (status == 412) {
     return Failure(text.empty() ? std::string("http-412") : text);
   }
+  return Failure("http-" + std::to_string(status));
+}
+
+// --- GitHub contents API ----------------------------------------------------
+//
+// The GitHub host is the owner's own permanent repo. A cover is written once,
+// named by the SHA-256 of the uploaded bytes, so re-uploading the same image is
+// idempotent: the contents API answers 422 (or 409) when the file is already
+// present, and that is treated as success via the raw URL. The access token is
+// only ever placed in the Authorization header of a request to api.github.com;
+// it never reaches a Result, the cache, or a log line.
+
+std::string Base64Encode(const unsigned char* data, size_t length) {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string encoded;
+  encoded.reserve(((length + 2) / 3) * 4);
+  size_t i = 0;
+  while (i + 3 <= length) {
+    const uint32_t chunk = (static_cast<uint32_t>(data[i]) << 16) |
+                           (static_cast<uint32_t>(data[i + 1]) << 8) |
+                           static_cast<uint32_t>(data[i + 2]);
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3f]);
+    encoded.push_back(kAlphabet[chunk & 0x3f]);
+    i += 3;
+  }
+  const size_t remaining = length - i;
+  if (remaining == 1) {
+    const uint32_t chunk = static_cast<uint32_t>(data[i]) << 16;
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+    encoded += "==";
+  } else if (remaining == 2) {
+    const uint32_t chunk = (static_cast<uint32_t>(data[i]) << 16) |
+                           (static_cast<uint32_t>(data[i + 1]) << 8);
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3f]);
+    encoded.push_back('=');
+  }
+  return encoded;
+}
+
+// A small, dependency-free JSON string field reader in the same style as
+// album_art.cpp's extractor: find the quoted key, then read the quoted string
+// that follows it. GitHub's URLs never contain escapes, but a backslash is
+// consumed so a surprising response cannot desync the scan.
+std::string ExtractJsonStringField(const std::string& json, const std::string& key) {
+  const size_t position = json.find("\"" + key + "\"");
+  if (position == std::string::npos) {
+    return std::string();
+  }
+  size_t cursor = position + key.size() + 2;
+  const auto skip_space = [&]() {
+    while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t' ||
+                                    json[cursor] == '\r' || json[cursor] == '\n')) {
+      ++cursor;
+    }
+  };
+  skip_space();
+  if (cursor >= json.size() || json[cursor] != ':') {
+    return std::string();
+  }
+  ++cursor;
+  skip_space();
+  if (cursor >= json.size() || json[cursor] != '"') {
+    return std::string();
+  }
+  ++cursor;
+  std::string value;
+  while (cursor < json.size() && json[cursor] != '"') {
+    if (json[cursor] == '\\' && cursor + 1 < json.size()) {
+      ++cursor;
+    }
+    value.push_back(json[cursor]);
+    ++cursor;
+  }
+  return value;
+}
+
+std::string GitHubRawUrl(const std::wstring& owner, const std::wstring& repo,
+                         const std::string& name) {
+  return "https://raw.githubusercontent.com/" + Utils::ToString(owner) + "/" +
+         Utils::ToString(repo) + "/main/covers/" + name + ".jpg";
+}
+
+// The exact request the GitHub host sends. Split out as a pure builder so the
+// method, target, headers and JSON body are testable without a network.
+struct GitHubRequest {
+  std::wstring method;
+  std::wstring host;
+  std::wstring path;
+  std::wstring headers;
+  std::string body;
+};
+
+GitHubRequest BuildGitHubRequest(const std::string& token, const std::wstring& owner,
+                                 const std::wstring& repo, const std::string& name,
+                                 const std::vector<unsigned char>& image) {
+  GitHubRequest request;
+  request.method = L"PUT";
+  request.host = L"api.github.com";
+  request.path =
+      L"/repos/" + owner + L"/" + repo + L"/contents/covers/" + Utils::ToWString(name) + L".jpg";
+  request.headers = L"Authorization: Bearer " + Utils::ToWString(token) + L"\r\n" +
+                    L"Accept: application/vnd.github+json\r\n" +
+                    L"User-Agent: AIMP-Discord-Presence\r\n" +
+                    L"X-GitHub-Api-Version: 2022-11-28\r\n" +
+                    L"Content-Type: application/json\r\n";
+  const std::string encoded =
+      Base64Encode(image.empty() ? nullptr : image.data(), image.size());
+  const std::string short_sha = name.size() >= 7 ? name.substr(0, 7) : name;
+  request.body = "{\"message\":\"add cover " + short_sha + "\",\"content\":\"" + encoded +
+                 "\",\"branch\":\"main\"}";
+  return request;
+}
+
+// Classifies a GitHub contents PUT. The success body is JSON and the URL is
+// content.download_url, pinned to this exact owner and repo; a body without
+// that field is never adopted as a URL. 422/409 mean the immutable file is
+// already there, so the constructed raw URL is returned and the caller's health
+// check proves it retrievable.
+Result ClassifyGitHubResponse(DWORD status, const std::string& body, const std::wstring& owner,
+                              const std::wstring& repo, const std::string& name) {
+  if (status == 200 || status == 201) {
+    const std::string text = TrimWhitespace(body);
+    if (text.empty()) {
+      return Failure("empty-body");
+    }
+    const std::string download = ExtractJsonStringField(text, "download_url");
+    const std::string prefix = "https://raw.githubusercontent.com/" + Utils::ToString(owner) +
+                               "/" + Utils::ToString(repo) + "/";
+    if (download.size() > prefix.size() && download.compare(0, prefix.size(), prefix) == 0 &&
+        LooksLikeHostUrl(download, UploadHost{L"", L"", L"", UploadShape::kGitHub})) {
+      Result result;
+      result.ok = true;
+      result.url = download;
+      return result;
+    }
+    return Failure("http-" + std::to_string(status) + "-unexpected-body");
+  }
+  if (status == 422 || status == 409) {
+    Result result;
+    result.ok = true;
+    result.url = GitHubRawUrl(owner, repo, name);
+    return result;
+  }
+  // 401/403 (bad or expired token) and every other status name only the status;
+  // the response body is never echoed, so nothing it contains can leak.
   return Failure("http-" + std::to_string(status));
 }
 
@@ -437,6 +669,11 @@ std::string Sha256Hex(const std::vector<unsigned char>& bytes) {
 // Compression is a best-effort transfer-size reduction, never a gate: any WIC
 // failure returns the original bytes untouched. The sizing decision is split
 // out as a pure function so it is testable without an encoder.
+//
+// Discord crops the large image to a centre square, so the re-encode first
+// centre-crops to the shorter side and then scales that square down to at most
+// kMaxImageDimension (512). The existing skip rule still holds: an image that
+// is already at or below 512 px on both sides and at most 256 KB is not touched.
 struct CompressionPlan {
   bool reencode = false;
   UINT width = 0;
@@ -448,21 +685,15 @@ CompressionPlan PlanCompression(UINT width, UINT height, size_t byte_size) {
   if (width == 0 || height == 0) {
     return plan;
   }
-  const UINT longest = width > height ? width : height;
-  if (longest <= kMaxImageDimension && byte_size <= kSkipReencodeMaxBytes) {
+  if (width <= kMaxImageDimension && height <= kMaxImageDimension &&
+      byte_size <= kSkipReencodeMaxBytes) {
     return plan;
   }
   plan.reencode = true;
-  if (longest <= kMaxImageDimension) {
-    plan.width = width;
-    plan.height = height;
-    return plan;
-  }
-  const double scale = static_cast<double>(kMaxImageDimension) / static_cast<double>(longest);
-  const double scaled_width = std::round(static_cast<double>(width) * scale);
-  const double scaled_height = std::round(static_cast<double>(height) * scale);
-  plan.width = static_cast<UINT>(scaled_width < 1.0 ? 1.0 : scaled_width);
-  plan.height = static_cast<UINT>(scaled_height < 1.0 ? 1.0 : scaled_height);
+  const UINT shorter = width < height ? width : height;
+  const UINT side = shorter > kMaxImageDimension ? kMaxImageDimension : shorter;
+  plan.width = side;
+  plan.height = side;
   return plan;
 }
 
@@ -538,6 +769,7 @@ PreparedImage PrepareImageForUpload(const std::vector<unsigned char>& source, co
     if (error.empty() && !plan.reencode) {
       prepared = OriginalImage(source, mime, source_width, source_height, std::string());
     } else if (error.empty()) {
+      Microsoft::WRL::ComPtr<IWICBitmapClipper> clipper;
       Microsoft::WRL::ComPtr<IWICBitmapScaler> scaler;
       Microsoft::WRL::ComPtr<IStream> output_stream;
       Microsoft::WRL::ComPtr<IWICStream> wic_output;
@@ -545,9 +777,23 @@ PreparedImage PrepareImageForUpload(const std::vector<unsigned char>& source, co
       Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> encoder_frame;
       Microsoft::WRL::ComPtr<IPropertyBag2> properties;
 
-      hr = factory->CreateBitmapScaler(&scaler);
+      // Centre-crop to the shorter side first, so the encode is square exactly
+      // as Discord frames it; the scaler then brings that square within 512 px.
+      hr = factory->CreateBitmapClipper(&clipper);
       if (SUCCEEDED(hr)) {
-        hr = scaler->Initialize(frame.Get(), plan.width, plan.height, WICBitmapInterpolationModeFant);
+        const UINT shorter = source_width < source_height ? source_width : source_height;
+        WICRect crop = {};
+        crop.X = static_cast<INT>((source_width - shorter) / 2);
+        crop.Y = static_cast<INT>((source_height - shorter) / 2);
+        crop.Width = static_cast<INT>(shorter);
+        crop.Height = static_cast<INT>(shorter);
+        hr = clipper->Initialize(frame.Get(), &crop);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = factory->CreateBitmapScaler(&scaler);
+      }
+      if (SUCCEEDED(hr)) {
+        hr = scaler->Initialize(clipper.Get(), plan.width, plan.height, WICBitmapInterpolationModeFant);
       }
       if (SUCCEEDED(hr)) {
         hr = CreateStreamOnHGlobal(nullptr, TRUE, output_stream.GetAddressOf());
@@ -1003,7 +1249,8 @@ struct ReadOutcome {
   DWORD error = 0;
 };
 
-ReadOutcome ReadResponseBody(HINTERNET request, const Deadline& deadline, std::string* out) {
+ReadOutcome ReadResponseBody(HINTERNET request, const Deadline& deadline, std::string* out,
+                             size_t max_bytes = kMaxResponseBytes) {
   out->clear();
   ReadOutcome outcome;
   for (;;) {
@@ -1022,8 +1269,8 @@ ReadOutcome ReadResponseBody(HINTERNET request, const Deadline& deadline, std::s
       outcome.ok = true;
       return outcome;
     }
-    if (available > kMaxResponseBytes) {
-      available = kMaxResponseBytes;
+    if (available > max_bytes) {
+      available = static_cast<DWORD>(max_bytes);
     }
     const size_t offset = out->size();
     out->resize(offset + available);
@@ -1034,7 +1281,7 @@ ReadOutcome ReadResponseBody(HINTERNET request, const Deadline& deadline, std::s
       return outcome;
     }
     out->resize(offset + read);
-    if (read == 0 || out->size() >= kMaxResponseBytes) {
+    if (read == 0 || out->size() >= max_bytes) {
       outcome.ok = true;
       return outcome;
     }
@@ -1077,11 +1324,11 @@ UploadAttempt UploadMultipartBody(const UploadHost& upload_host, const std::stri
   if (!session) {
     return TransportFailure("session-open-failed", "connect", GetLastError());
   }
-  WinHttpHandle connection(WinHttpConnect(session.get(), upload_host.host, INTERNET_DEFAULT_HTTPS_PORT, 0));
+  WinHttpHandle connection(WinHttpConnect(session.get(), upload_host.host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
   if (!connection) {
     return TransportFailure("connect-failed", "connect", GetLastError());
   }
-  WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"POST", upload_host.path, nullptr, WINHTTP_NO_REFERER,
+  WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"POST", upload_host.path.c_str(), nullptr, WINHTTP_NO_REFERER,
                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
   if (!request) {
     return TransportFailure("request-open-failed", "send", GetLastError());
@@ -1112,6 +1359,88 @@ UploadAttempt UploadMultipartBody(const UploadHost& upload_host, const std::stri
     return TransportFailure(read.tag, "receive", read.error);
   }
   return AttemptResult(ClassifyUploadResponse(status, response, upload_host.shape));
+}
+
+// Sends the GitHub contents PUT. The token is read from the guarded config and
+// placed only in this request's Authorization header; the request and its
+// headers are stack-local and are never logged. The success response is parsed
+// for content.download_url; 422/409 is the immutable file already being there.
+UploadAttempt UploadGitHubBody(const std::wstring& owner, const std::wstring& repo,
+                               const std::string& name,
+                               const std::vector<unsigned char>& image) {
+  std::string token;
+  {
+    std::lock_guard<std::mutex> lock(g_host_mutex);
+    token = g_github_token;
+  }
+  if (token.empty()) {
+    return AttemptResult(Failure("github-no-token"));
+  }
+  const GitHubRequest github = BuildGitHubRequest(token, owner, repo, name, image);
+  if (github.body.size() > 0xffffffffull) {
+    return AttemptResult(Failure("body-too-large"));
+  }
+  const Deadline deadline(kTotalTimeoutMs);
+  WinHttpHandle session = OpenSession(deadline);
+  if (!session) {
+    return TransportFailure("session-open-failed", "connect", GetLastError());
+  }
+  WinHttpHandle connection(
+      WinHttpConnect(session.get(), github.host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+  if (!connection) {
+    return TransportFailure("connect-failed", "connect", GetLastError());
+  }
+  WinHttpHandle request(WinHttpOpenRequest(connection.get(), github.method.c_str(),
+                                           github.path.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
+  if (!request) {
+    return TransportFailure("request-open-failed", "send", GetLastError());
+  }
+  const DWORD body_size = static_cast<DWORD>(github.body.size());
+  if (WinHttpSendRequest(request.get(), github.headers.c_str(), static_cast<DWORD>(-1),
+                         const_cast<char*>(github.body.data()), body_size, body_size, 0) == FALSE) {
+    return TransportFailure("send-failed", "send", GetLastError());
+  }
+  if (WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
+    return TransportFailure("receive-failed", "receive", GetLastError());
+  }
+  DWORD status = 0;
+  DWORD status_error = 0;
+  if (!QueryStatusCode(request.get(), &status, &status_error)) {
+    return AttemptResult(Failure("status-query-failed phase=receive winhttp=" +
+                                 std::to_string(status_error)));
+  }
+  std::string response;
+  const ReadOutcome read =
+      ReadResponseBody(request.get(), deadline, &response, kMaxGitHubResponseBytes);
+  if (!read.ok) {
+    if (status == 200 || status == 201 || status == 422 || status == 409 || status == 401 ||
+        status == 403) {
+      return AttemptResult(ClassifyGitHubResponse(status, response, owner, repo, name));
+    }
+    return TransportFailure(read.tag, "receive", read.error);
+  }
+  return AttemptResult(ClassifyGitHubResponse(status, response, owner, repo, name));
+}
+
+// Dispatches one attempt to the transport that matches the host's shape. The
+// GitHub host needs the owner/repo (from the guarded config) and the cover name;
+// the keyless hosts build their multipart body here.
+UploadAttempt AttemptHostUpload(const UploadHost& upload_host, const PreparedImage& prepared) {
+  if (upload_host.shape == UploadShape::kGitHub) {
+    std::wstring owner;
+    std::wstring repo;
+    {
+      std::lock_guard<std::mutex> lock(g_host_mutex);
+      owner = g_github_owner;
+      repo = g_github_repo;
+    }
+    return UploadGitHubBody(owner, repo, UploadCacheKey(prepared), prepared.bytes);
+  }
+  const std::string content_type = SanitizeMime(prepared.mime.c_str());
+  const std::string boundary = MakeBoundary();
+  const std::string body = BuildMultipartBody(boundary, content_type, prepared.bytes, upload_host.shape);
+  return UploadMultipartBody(upload_host, body, boundary);
 }
 
 bool CrackUrl(const std::string& url, std::wstring* host, std::wstring* path) {
@@ -1223,14 +1552,11 @@ struct HostOutcome {
 
 HostOutcome TryUploadHost(const UploadHost& upload_host, const PreparedImage& prepared) {
   HostOutcome outcome;
-  const std::string content_type = SanitizeMime(prepared.mime.c_str());
-  const std::string boundary = MakeBoundary();
-  const std::string body = BuildMultipartBody(boundary, content_type, prepared.bytes, upload_host.shape);
-  UploadAttempt attempt = UploadMultipartBody(upload_host, body, boundary);
+  UploadAttempt attempt = AttemptHostUpload(upload_host, prepared);
   outcome.attempts = 1;
   if (attempt.transport_failure) {
     Sleep(kRetryBackoffMs);
-    attempt = UploadMultipartBody(upload_host, body, boundary);
+    attempt = AttemptHostUpload(upload_host, prepared);
     outcome.attempts = 2;
   }
   outcome.result = attempt.result;
@@ -1246,14 +1572,15 @@ HostOutcome TryUploadHost(const UploadHost& upload_host, const PreparedImage& pr
 }
 
 // Every configured host, in order, in one comma-separated token for the failure
-// marker: "litter.catbox.moe,uguu.se".
+// marker: "github.com,catbox.moe,uguu.se,litter.catbox.moe".
 std::string HostListToken() {
+  const std::vector<UploadHost> hosts = ActiveHosts();
   std::string token;
-  for (size_t i = 0; i < kUploadHostCount; ++i) {
+  for (size_t i = 0; i < hosts.size(); ++i) {
     if (i != 0) {
       token += ",";
     }
-    token += Utils::ToString(kUploadHosts[i].name);
+    token += Utils::ToString(hosts[i].name);
   }
   return token;
 }
@@ -1266,6 +1593,17 @@ void EmitLog(const std::string& line) {
   if (g_logger != nullptr) {
     g_logger(line);
   }
+}
+
+// Names the GitHub host's authentication state, never the token: a configured
+// token logs "auth=present", an empty one "auth=absent". A 401/403 from GitHub
+// logs "auth=rejected" with the status only.
+void LogGitHubAuthState() {
+  EmitLog(std::string("local-cover github auth=") + (GitHubTokenPresent() ? "present" : "absent"));
+}
+
+void LogGitHubAuthRejected(const std::string& status) {
+  EmitLog("local-cover github auth=rejected status=" + status);
 }
 
 void LogHostSuccess(const Result& result) {
@@ -1294,10 +1632,11 @@ bool AnyHostHealthy(const bool* reachable, size_t count) {
   return false;
 }
 
-constexpr size_t ConfiguredHostCount() { return kUploadHostCount; }
+size_t ConfiguredHostCount() { return ActiveHosts().size(); }
 
-const char* ConfiguredHostName(size_t index) {
-  return index < kUploadHostCount ? kUploadHostNames[index] : "";
+std::string ConfiguredHostName(size_t index) {
+  const std::vector<UploadHost> hosts = ActiveHosts();
+  return index < hosts.size() ? Utils::ToString(hosts[index].name) : std::string();
 }
 
 }  // namespace
@@ -1319,6 +1658,17 @@ void Configure(const std::string& cache_path) {
   }
 }
 
+void ConfigureAuth(const std::string& token, const std::string& repo) {
+  std::wstring owner;
+  std::wstring name;
+  const std::wstring configured = repo.empty() ? std::wstring(kDefaultGitHubRepo) : Utils::ToWString(repo);
+  ParseOwnerRepo(configured, &owner, &name);
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  g_github_token = token;
+  g_github_owner = owner;
+  g_github_repo = name;
+}
+
 Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) {
   try {
     if (image_bytes.empty()) {
@@ -1336,15 +1686,23 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
       return cached;
     }
 
-    // Ordered fallback inside one publish: try litterbox, then uguu. Both are
-    // the same layer - a host failure never skips the online rung. Each host
-    // builds its own multipart shape and is retried once on a transport failure
-    // only.
+    // Ordered fallback inside one publish: GitHub first when a token is set
+    // (the owner's permanent repo), then catbox, then uguu, then the dormant
+    // litterbox. All are the same layer - a host failure never skips the online
+    // rung. Each host is retried once on a transport failure only.
+    LogGitHubAuthState();
+    const std::vector<UploadHost> hosts = ActiveHosts();
     Result result;
     int total_attempts = 0;
-    for (size_t i = 0; i < kUploadHostCount; ++i) {
-      const HostOutcome outcome = TryUploadHost(kUploadHosts[i], prepared);
+    for (size_t i = 0; i < hosts.size(); ++i) {
+      const HostOutcome outcome = TryUploadHost(hosts[i], prepared);
       total_attempts += outcome.attempts;
+      if (!outcome.result.ok && hosts[i].shape == UploadShape::kGitHub) {
+        const std::string& reason = outcome.result.reason;
+        if (reason == "http-401" || reason == "http-403") {
+          LogGitHubAuthRejected(reason.substr(5));
+        }
+      }
       if (outcome.result.ok) {
         result = outcome.result;
         break;
