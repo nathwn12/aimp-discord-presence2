@@ -74,20 +74,21 @@ constexpr float kJpegQuality = 0.85f;
 
 constexpr wchar_t kAgentName[] = L"AIMP-Discord-Presence/2.0";
 
-// Upload hosts are tried in order until one returns a usable URL, so a host
-// that is down or blocked for this network (litterbox now answers HTTP 403 to a
-// BunkerWeb WAF) no longer costs the cover. litterbox stays first because it
-// may work again on other networks/regions; uguu.se is the keyless fallback
-// measured working (POST /upload?output=text with a `files[]` field, responding
-// with the bare URL as text). Each host owns both its endpoint and the shape of
-// the multipart body it accepts.
+// Upload hosts are tried in order until one returns a usable URL. The order is
+// the whole point: uguu.se is FIRST because it is the host measured working from
+// here, so the common path never pays for a dead host; litter.catbox.moe is kept
+// LAST as a dormant fallback - it answers HTTP 403 to a BunkerWeb WAF on this
+// network, so it is never reached when uguu succeeds, but it may still serve
+// other networks and other users of this plugin. A host that fails costs its
+// round trip only, and never skips a layer of the cover chain.
+// Each host owns both its endpoint and the shape of the multipart body.
 enum class UploadShape {
-  // litterbox: POST /resources/internals/api.php with reqtype=fileupload,
-  // time=72h and the image in `fileToUpload`.
-  kLitterbox,
   // uguu: POST /upload?output=text with no extra fields and the image in
   // `files[]`. The response body is the bare URL as text.
   kUguu,
+  // litterbox: POST /resources/internals/api.php with reqtype=fileupload,
+  // time=72h and the image in `fileToUpload`.
+  kLitterbox,
 };
 
 struct UploadHost {
@@ -114,13 +115,13 @@ std::string HostNameUtf8(const UploadHost& upload_host) {
 
 constexpr size_t kUploadHostCount = 2;
 constexpr UploadHost kUploadHosts[kUploadHostCount] = {
-    {L"litter.catbox.moe", L"litterbox.catbox.moe", L"/resources/internals/api.php", UploadShape::kLitterbox},
     {L"uguu.se", L"uguu.se", L"/upload?output=text", UploadShape::kUguu},
+    {L"litter.catbox.moe", L"litterbox.catbox.moe", L"/resources/internals/api.php", UploadShape::kLitterbox},
 };
 
 // The log markers as narrow strings, index-parallel to kUploadHosts, so a
 // caller can name a host without a UTF-8 conversion at each use.
-constexpr const char* kUploadHostNames[kUploadHostCount] = {"litter.catbox.moe", "uguu.se"};
+constexpr const char* kUploadHostNames[kUploadHostCount] = {"uguu.se", "litter.catbox.moe"};
 
 // Each host owns the exact URL shape it answers with, so a lookalike host
 // ("...moe.evil.test") or a body that is not that host's URL is rejected. The

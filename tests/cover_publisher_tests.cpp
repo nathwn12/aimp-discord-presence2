@@ -176,14 +176,23 @@ Result RunHostFallback(const std::vector<Result>& per_host) {
 void TestHostFallback() {
   const std::string uguu_url = "https://n.uguu.se/nUoxUKCo.png";
 
-  // Host 1 fails with 403, host 2 succeeds: overall ok with host 2's URL.
+  // The working host is first, so the common path needs no fallback at all: a
+  // 200 from host 0 is the overall result.
+  std::vector<Result> happy;
+  happy.push_back(ClassifyUploadResponse(200, uguu_url, UploadShape::kUguu));
+  const Result direct = RunHostFallback(happy);
+  Check(direct.ok && direct.url == uguu_url,
+        "host fallback: a working host 0 is used directly, no fallback needed");
+
+  // Host 0 fails (the dormant litterbox answering 403) and the next succeeds.
   std::vector<Result> outcomes;
-  outcomes.push_back(ClassifyUploadResponse(403, "<html>BunkerWeb</html>"));
   outcomes.push_back(ClassifyUploadResponse(200, uguu_url, UploadShape::kUguu));
+  outcomes.push_back(ClassifyUploadResponse(403, "<html>BunkerWeb</html>"));
   const Result fell_back = RunHostFallback(outcomes);
-  Check(!outcomes[0].ok, "host fallback: host 1's 403 is a failure");
+  Check(outcomes[0].ok, "host fallback: uguu's 200 succeeds first");
+  Check(!outcomes[1].ok, "host fallback: litterbox's 403 is a failure");
   Check(fell_back.ok && fell_back.url == uguu_url,
-        "host fallback: first host 403 and second succeeds -> ok with host 2 url");
+        "host fallback: later host failure never discards an earlier success");
 
   // All hosts fail: overall failure. The caller must then try the online rung,
   // not jump to black.
@@ -253,22 +262,25 @@ void TestHostList() {
   Check(kUploadHostCount == 2, "host list has exactly two hosts");
   Check(ConfiguredHostCount() == 2, "configured host count matches");
 
-  // Order is the fallback order: litterbox first, uguu second. A host failure
-  // moves down the list, never to a different layer.
-  Check(std::string(ConfiguredHostName(0)) == "litter.catbox.moe",
-        "host 0 is litterbox");
-  Check(std::string(ConfiguredHostName(1)) == "uguu.se", "host 1 is uguu");
+  // Order is the fallback order, working host first: uguu (measured working
+  // from here) then litterbox (dormant - a WAF 403s it on this network, so it
+  // is never reached when uguu succeeds, but it costs nothing to keep last).
+  // A host failure moves down the list, never to a different layer.
+  Check(std::string(ConfiguredHostName(0)) == "uguu.se",
+        "host 0 is uguu - the working host is tried first");
+  Check(std::string(ConfiguredHostName(1)) == "litter.catbox.moe",
+        "host 1 is litterbox - kept last as a dormant fallback");
   Check(ConfiguredHostName(2)[0] == '\0', "an out-of-range host name is empty");
 
   // Each entry carries its own endpoint and multipart shape.
-  Check(std::wstring(kUploadHosts[0].host) == L"litterbox.catbox.moe" &&
-            std::wstring(kUploadHosts[0].path) == L"/resources/internals/api.php" &&
-            kUploadHosts[0].shape == UploadShape::kLitterbox,
-        "litterbox owns its endpoint and fileToUpload shape");
-  Check(std::wstring(kUploadHosts[1].host) == L"uguu.se" &&
-            std::wstring(kUploadHosts[1].path) == L"/upload?output=text" &&
-            kUploadHosts[1].shape == UploadShape::kUguu,
+  Check(std::wstring(kUploadHosts[0].host) == L"uguu.se" &&
+            std::wstring(kUploadHosts[0].path) == L"/upload?output=text" &&
+            kUploadHosts[0].shape == UploadShape::kUguu,
         "uguu owns its endpoint and files[] shape");
+  Check(std::wstring(kUploadHosts[1].host) == L"litterbox.catbox.moe" &&
+            std::wstring(kUploadHosts[1].path) == L"/resources/internals/api.php" &&
+            kUploadHosts[1].shape == UploadShape::kLitterbox,
+        "litterbox owns its endpoint and fileToUpload shape");
 }
 
 // --- Multipart shapes differ correctly per host ----------------------------
@@ -1148,10 +1160,15 @@ int main(int argc, char** argv) {
 
   TestUrlShape();
   TestClassifier();
+  TestHostFallback();
   TestMultipartArithmetic();
+  TestHostList();
+  TestMultipartShapes();
   TestBoundary();
   TestAlbumIdentityKeys();
   TestCoverFallbackChain();
+  TestCoverLayerOrder();
+  TestPublishPendingNotBlank();
   TestOnlineRungDecision();
   TestAlbumlessOnlineRung();
   TestSha256();
