@@ -136,8 +136,8 @@ class AimpDiscordPresence :
     std::wstring cover_token;
     std::wstring cover_repo = L"nathwn12/aimp-discord-presence-art";
     // What the member-list status line shows: 0 = name, 1 = state (artist),
-    // 2 = details (track title). Defaults to 2, the title-prominent layout.
-    int status_display_type = 2;
+    // 2 = details (track title). Defaults to 1, the artist in member list.
+    int status_display_type = 1;
     // Optional file for the Discord IPC frame log. Empty (the default) leaves
     // logging off. A bare filename resolves next to the plugin DLL; an
     // absolute path is used as given.
