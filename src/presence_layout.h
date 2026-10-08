@@ -23,11 +23,11 @@
 
 #include <string>
 
-// The Discord presence field mapping, kept in one place:
+// The Discord presence field mapping, kept in one place (Spotify parity):
 //
-//   details    (line 2)  the artist; falls back to the track title, then to
+//   details    (line 2)  the track title; falls back to the artist, then to
 //                        the literal "AIMP", so the line is never blank
-//   state      (line 3)  the track title; falls back to the album, and is
+//   state      (line 3)  the artist; falls back to the album, and is
 //                        omitted when that would repeat `details`
 //   large_text           the album (the album-art tooltip); omitted when it
 //                        would repeat `details` or `state`
@@ -38,7 +38,7 @@
 // count as absent.
 //
 // With status_display_type = 2 (Details), Discord renders `details` - the
-// artist - in the member-list status line.
+// track title - in the member-list status line.
 namespace PresenceLayout {
 
 // Last-resort large_image when no album art URL was resolved: a solid black
@@ -56,22 +56,25 @@ constexpr const char* kFallbackLargeImageUrl =
 constexpr const char* kFallbackDetails = "AIMP";
 
 struct TextFields {
-  std::string details;     // artist, else title, else kFallbackDetails
-  std::string state;       // title, else album; empty omits the field
+  std::string details;     // title, else artist, else kFallbackDetails
+  std::string state;       // artist, else album; empty omits the field
   std::string large_text;  // album; empty omits the field
 };
 
-// Artist -> song title -> album, de-duplicated. `details` is never empty;
-// `state` falls back to the album only when the title would repeat `details`;
-// `large_text` is dropped when the album would repeat either line.
+// Title -> artist -> album, de-duplicated (Spotify parity: the track title is
+// the prominent line, the artist is second). `details` is never empty;
+// `state` falls back to the album only when the artist is empty or would
+// repeat `details`; `large_text` is dropped when the album would repeat either
+// line. Truncation stays downstream (NormalizeTextField, 128 codepoints), so
+// this builder does no cutting itself.
 inline TextFields BuildTextFields(const std::string& artist,
                                   const std::string& album,
                                   const std::string& title) {
   TextFields fields;
-  fields.details = !artist.empty() ? artist
-                                   : (!title.empty() ? title : kFallbackDetails);
+  fields.details = !title.empty() ? title
+                                  : (!artist.empty() ? artist : kFallbackDetails);
 
-  fields.state = title;
+  fields.state = artist;
   if (fields.state.empty() || fields.state == fields.details) {
     fields.state = album;
   }

@@ -118,7 +118,7 @@ class AimpDiscordPresence :
 
   struct Properties {
     int64_t application_id = 429559336982020107LL;
-    bool timestamp = false;
+    bool timestamp = true;
     bool use_albumart = true;
     bool use_albumart_online = true;
     // Publishes the track's own (offline) cover for Discord to fetch.
@@ -135,8 +135,8 @@ class AimpDiscordPresence :
     // token is never logged, cached, or written anywhere by the plugin.
     std::wstring cover_token;
     std::wstring cover_repo = L"nathwn12/aimp-discord-presence-art";
-    // What the member-list status line shows: 0 = name, 1 = state (album),
-    // 2 = details (artist). Defaults to 2, the artist-first layout.
+    // What the member-list status line shows: 0 = name, 1 = state (artist),
+    // 2 = details (track title). Defaults to 2, the title-prominent layout.
     int status_display_type = 2;
     // Optional file for the Discord IPC frame log. Empty (the default) leaves
     // logging off. A bare filename resolves next to the plugin DLL; an

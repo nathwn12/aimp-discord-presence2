@@ -465,9 +465,9 @@ void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
   activity_.type = static_cast<int>(DiscordIpc::ActivityType::kListening);
   activity_.status_display_type = settings.status_display_type;
 
-  // Artist First -> Album Next: details is the artist (falling back to the
-  // track title), state is the album, and the track title is the large-image
-  // tooltip. Empty values omit their field.
+  // Title-prominent (Spotify parity): details is the track title (falling
+  // back to the artist), state is the artist, and the album is the
+  // large-image tooltip. Empty values omit their field.
   const PresenceLayout::TextFields fields =
       PresenceLayout::BuildTextFields(info.artist, info.album, info.title);
   activity_.details = fields.details;
@@ -514,22 +514,29 @@ void AimpDiscordPresence::SetTimestamp(const TrackInfo& info) {
   activity_.start_timestamp = 0;
   activity_.end_timestamp = 0;
 
+  const int64_t now = UnixSecondsNow();
+
+  // Paused: count UP from the pause moment (start-only, no end), Potflix gate
+  // parity (gate.go:146-160).
   if (paused_) {
+    activity_.start_timestamp = now;
     return;
   }
 
   Aimp::Player::Service::Player player;
   const int position = static_cast<int>(round(player.Position()));
-  const int64_t start = UnixSecondsNow();
-
+  // Elapsed anchor is always now-pos; the projected end is added only when the
+  // bar is enabled, the source is a local file, and the duration is known
+  // (total > pos), Potflix gate parity (gate.go:129-137). Streams and
+  // bar-off stay start-only (count-up, no bar).
   if (settings.timestamp && !info.is_url) {
     const int duration = static_cast<int>(round(player.Duration()));
-    activity_.start_timestamp = start;
+    activity_.start_timestamp = now - position;
     if (duration - position > 0) {
-      activity_.end_timestamp = start + duration - position;
+      activity_.end_timestamp = now + duration - position;
     }
   } else {
-    activity_.start_timestamp = start - position;
+    activity_.start_timestamp = now - position;
   }
 }
 
