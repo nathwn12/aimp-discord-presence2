@@ -30,8 +30,11 @@
 // and JPEG re-encode whenever that shrinks the transfer), uploads it to
 // litterbox, then proves the upload is actually retrievable (a bare GET of the
 // returned URL must answer 200 with an image/* content type) before reporting
-// success. Distinct images are uploaded once: the returned URL is cached on
-// disk, keyed by the SHA-256 of the bytes that were uploaded. A transport
+// success. Distinct images are uploaded once and the returned URL is cached on
+// disk, keyed by the SHA-256 of the bytes that were uploaded - except a cached
+// URL on an ephemeral keyless host, which is re-published to the permanent
+// GitHub host when a token is configured, and revalidated (re-published when
+// dead) otherwise, so a dead cached URL is never sent. A transport
 // failure is retried once after a short pause; host answers (a 412, an empty
 // body) are never retried. Failures are cached briefly too, so a host outage is
 // not hammered from the player's callback.

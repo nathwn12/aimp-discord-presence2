@@ -401,12 +401,12 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
   // thread once per new track, log its fingerprint, and either apply a URL
   // already known for that image or hand the bytes to the publisher worker.
   // A URL is only ever adopted when an upload proved retrievable, so the
-  // online chain's URL or the black fallback stays in place until then. Runs
+  // online chain's URL (or no image) stays in place until then. Runs
   // before SetInfo() so a known URL lands in this same update.
   // Local cover layers (1 and 2): the track's own embedded art, or a sidecar
   // image the extractor found. `local_art_found` records that a local cover
   // exists; when publishing it fails, the online rung below must still be asked
-  // - black is only for a track where every layer failed.
+  // - no image is sent only for a track where every layer failed.
   bool local_art_found = false;
   bool local_published = false;
   if (request_artwork && info.key != local_art_key_) {
@@ -422,7 +422,7 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
         MaybePublishLocalCover(info, std::move(art));
         // MaybePublishLocalCover applies a URL synchronously only on a known
         // hit; an in-flight upload leaves local_cover_url_ empty, and that is
-        // exactly the case that must fall through to online rather than black.
+        // exactly the case that must fall through to online rather than no image.
         std::lock_guard<std::mutex> lock(presence_mutex_);
         local_published = !local_cover_url_.empty();
       }
@@ -449,7 +449,7 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
       // notification applies it. The album tag is not required: an album-less
       // track still gets a keyless lookup, keyed by artist + file path. A local
       // cover that was found never suppresses this request: if its publish
-      // fails, the online rung below is what keeps the card off black.
+      // fails, the online rung below is what may still supply an image.
       album_art_.Request(info.artist, info.album, info.file);
     } else {
       std::lock_guard<std::mutex> lock(presence_mutex_);
@@ -553,7 +553,7 @@ void AimpDiscordPresence::ApplyResolvedArtwork(const std::string& artist, const 
 bool AimpDiscordPresence::ApplyPendingArtwork() {
   // A finished publish, if any. The URL is adopted only when the publisher
   // proved the upload retrievable (Result.ok); a failure is logged and leaves
-  // the online chain's URL or the black fallback in place.
+  // the online chain's URL (or no image) in place.
   {
     std::string hash;
     bool ok = false;
@@ -582,7 +582,7 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
     if (!hash.empty()) {
       if (!ok) {
         // The gate at work: no local URL is adopted, the host that failed is
-        // on record, and the online rung (or black) stays in place. The
+        // on record, and the online rung (or no image) stays in place. The
         // publisher's own negative cache keeps a dead host from being retried
         // immediately.
         LogCover("local-cover failed hash=" + hash +
@@ -643,7 +643,7 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
 
 std::string AimpDiscordPresence::ResolveLargeImageLocked(const std::string& album_key,
                                                          std::string* source) const {
-  // The setting turns both sources off; the black fallback then stays in place.
+  // The setting turns both sources off; no image is then sent.
   const std::string local_url = settings.use_albumart ? local_cover_url_ : std::string();
   const std::string online_url = settings.use_albumart ? artwork_url_ : std::string();
   return PresenceLayout::ResolveLargeImage(album_key, local_cover_key_, local_url,

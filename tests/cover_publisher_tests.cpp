@@ -198,7 +198,7 @@ void TestHostFallback() {
         "host fallback: later host failure never discards an earlier success");
 
   // All hosts fail: overall failure. The caller must then try the online rung,
-  // not jump to black.
+  // which may still supply an image.
   std::vector<Result> all_fail;
   all_fail.push_back(ClassifyUploadResponse(403, ""));
   all_fail.push_back(ClassifyUploadResponse(503, ""));
@@ -215,7 +215,7 @@ void TestHostFallback() {
   Check(PresenceLayout::ResolveLargeImage(key, "", "", key, online_url, &source) ==
             online_url &&
             source == "online",
-        "host fallback: no local url, online url wins over black");
+        "host fallback: no local url, online url is used");
 }
 
 // --- Multipart arithmetic ---------------------------------------------------
@@ -229,7 +229,8 @@ void TestHostFallback() {
 void TestMultipartArithmetic() {
   // The per-operation transport budget must stay small enough that a hung host
   // costs the card seconds, not tens of seconds. Measured: a real upload takes
-  // 0.8-4.1 s, so anything above ~10 s is a stall the owner would see as black.
+  // 0.8-4.1 s, so anything above ~10 s is a stall the owner would see as a
+  // missing image.
   Check(kTotalTimeoutMs <= 10000,
         "the per-operation transport budget is bounded so a hung host cannot stall the chain");
   Check(kTotalTimeoutMs >= 4000,
@@ -610,10 +611,10 @@ void TestHostFailureDoesNotSkipLayers() {
   Check(!none.ok, "an all-hosts failure leaves no local url");
   Check(ResolveCoverLayer("", "", online) == CoverLayer::kOnlineKeyless,
         "four-layer order: a failed local publish still descends to online");
-  Check(ResolveCoverLayer("", "", online) != CoverLayer::kBlackPng,
-        "four-layer order: black is not used while online resolved");
-  Check(ResolveCoverLayer("", "", "") == CoverLayer::kBlackPng,
-        "four-layer order: black is reachable only when embedded, sidecar and online all fail");
+  Check(ResolveCoverLayer("", "", online) != CoverLayer::kNoImage,
+        "four-layer order: no-image is not used while online resolved");
+  Check(ResolveCoverLayer("", "", "") == CoverLayer::kNoImage,
+        "four-layer order: no-image only when embedded, sidecar and online all fail");
 }
 
 void TestBoundary() {
@@ -673,22 +674,19 @@ void TestAlbumIdentityKeys() {
   // never adopted for the other.
   const std::string other_key = AlbumArt::BuildAlbumKey(artist, "", other_file);
   Check(albumless_key != other_key, "two album-less files by one artist get different keys");
-  Check(PresenceLayout::ResolveLargeImage(other_key, albumless_key, cover, "", "", &source) ==
-            PresenceLayout::kFallbackLargeImageUrl,
+  Check(PresenceLayout::ResolveLargeImage(other_key, albumless_key, cover, "", "", &source).empty(),
         "an album-less file cannot inherit another file's cover");
 
   // An album-less key never collides with a real album's key for the same
   // artist, in either direction, so neither can overwrite the other's cover.
   Check(albumless_key != album_key, "album-less key never equals a real album's key");
-  Check(PresenceLayout::ResolveLargeImage(album_key, albumless_key, cover, "", "", &source) ==
-            PresenceLayout::kFallbackLargeImageUrl,
+  Check(PresenceLayout::ResolveLargeImage(album_key, albumless_key, cover, "", "", &source).empty(),
         "an album-less cover cannot overwrite a real album's stored cover");
-  Check(PresenceLayout::ResolveLargeImage(albumless_key, album_key, cover, "", "", &source) ==
-            PresenceLayout::kFallbackLargeImageUrl,
+  Check(PresenceLayout::ResolveLargeImage(albumless_key, album_key, cover, "", "", &source).empty(),
         "a real album's cover cannot be applied to an album-less file");
 }
 
-// --- Final cover fallback chain: local -> online -> black PNG ---------------
+// --- Final cover chain: local -> online -> omitted ----------------------------
 
 void TestCoverFallbackChain() {
   const std::string artist = "ZWE1HVNDXR Feat yatashigang";
@@ -701,29 +699,29 @@ void TestCoverFallbackChain() {
       "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
   std::string source;
 
-  // (a) A published local cover wins; neither the online URL nor the black
-  // fallback is used.
+  // (a) A published local cover wins; the online URL is not used, and the
+  // field is not left empty.
   const std::string local_win =
       PresenceLayout::ResolveLargeImage(key, key, local_url, key, online_url, &source);
   Check(local_win == local_url, "chain: local cover is the resolved image");
   Check(source == "local", "chain: local cover names its source");
-  Check(local_win != online_url && local_win != PresenceLayout::kFallbackLargeImageUrl,
-        "chain: online and black are not used when local wins");
+  Check(local_win != online_url && !local_win.empty(),
+        "chain: online is not used and the field is not empty when local wins");
 
-  // (b) With no local cover, the online chain's URL is used; black is not.
+  // (b) With no local cover, the online chain's URL is used; the field is not
+  // left empty.
   const std::string online_win =
       PresenceLayout::ResolveLargeImage(key, "", "", key, online_url, &source);
   Check(online_win == online_url, "chain: online url is the resolved image");
   Check(source == "online", "chain: online url names its source");
-  Check(online_win != PresenceLayout::kFallbackLargeImageUrl,
-        "chain: black is not used when online wins");
+  Check(!online_win.empty(), "chain: the field is not empty when online wins");
 
-  // (c) With neither source resolved, the black PNG URL is the last resort.
-  const std::string fallback =
+  // (c) With neither source resolved, the field is empty (omitted on the wire,
+  // so Discord renders its native placeholder) - never a stand-in image URL.
+  const std::string empty =
       PresenceLayout::ResolveLargeImage(key, "", "", "", "", &source);
-  Check(fallback == PresenceLayout::kFallbackLargeImageUrl,
-        "chain: black png url is the last resort");
-  Check(source == "fallback", "chain: last resort names its source");
+  Check(empty.empty(), "chain: no source resolves to an empty image field");
+  Check(source == "none", "chain: the empty field names its source");
 
   // (d) The Task 1 regression: an album-less track with no local cover still
   // triggers the online lookup (the album tag is not part of the gate), and
@@ -740,14 +738,8 @@ void TestCoverFallbackChain() {
 
   // (e) The literal "aimp" - a foreign Discord application's bundled asset -
   // is never the resolved image in any case.
-  Check(local_win != "aimp" && online_win != "aimp" && fallback != "aimp",
+  Check(local_win != "aimp" && online_win != "aimp" && empty != "aimp",
         "chain: literal aimp is never the resolved image");
-  Check(std::string(PresenceLayout::kFallbackLargeImageUrl) != "aimp",
-        "chain: fallback constant is a url, never the aimp asset key");
-
-  // The fallback URL fits Discord's external-asset length limit.
-  Check(std::strlen(PresenceLayout::kFallbackLargeImageUrl) <= AlbumArt::kMaxUrlLength,
-        "chain: black png url fits the discord asset url limit");
 }
 
 // --- The explicit four-layer chain, in order -------------------------------
@@ -777,20 +769,20 @@ void TestCoverLayerOrder() {
   Check(ResolveCoverLayer("", "", online) == CoverLayer::kOnlineKeyless,
         "layer 3: online wins when both local layers failed");
 
-  // Layer 4: black is reached ONLY when all three above produced nothing.
-  Check(ResolveCoverLayer("", "", "") == CoverLayer::kBlackPng,
-        "layer 4: black only when embedded, sidecar and online all failed");
+  // Layer 4: no image is reached ONLY when all three above produced nothing.
+  Check(ResolveCoverLayer("", "", "") == CoverLayer::kNoImage,
+        "layer 4: no image only when embedded, sidecar and online all failed");
 
   // A local art extract that could not be published leaves its URL empty, so
-  // the chain descends to online - never straight to black.
+  // the chain descends to online - never straight to no-image.
   const std::string embedded_failed = "";   // extracted but upload failed
   const std::string sidecar_failed = "";    // sidecar found but upload failed
   Check(ResolveCoverLayer(embedded_failed, sidecar_failed, online) ==
             CoverLayer::kOnlineKeyless,
-        "layer order: a failed local publish falls through to online, not black");
+        "layer order: a failed local publish falls through to online, not no-image");
   Check(ResolveCoverLayer(embedded_failed, sidecar_failed, online) !=
-            CoverLayer::kBlackPng,
-        "layer order: black is not chosen while online resolved");
+            CoverLayer::kNoImage,
+        "layer order: no image is not chosen while online resolved");
 
   // The layer names are stable and greppable.
   Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kLocalEmbedded)) ==
@@ -802,8 +794,8 @@ void TestCoverLayerOrder() {
   Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kOnlineKeyless)) ==
             "online-keyless",
         "layer names: 3 is online-keyless");
-  Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kBlackPng)) == "black-png",
-        "layer names: 4 is black-png");
+  Check(std::string(PresenceLayout::CoverLayerName(CoverLayer::kNoImage)) == "no-image",
+        "layer names: 4 is no-image");
 
   // The online request is never suppressed by a local cover existing: a track
   // whose local art was found (and may still fail to publish) still asks online.
@@ -826,29 +818,27 @@ void TestPublishPendingNotBlank() {
   using PresenceLayout::ResolveCoverLayer;
 
   // While a local publish is in flight (no URL yet) the online rung may not
-  // have resolved either; the resolver is allowed to show black only when the
-  // caller has no usable URL. The *card* is not blanked because SetInfo only
-  // ever runs ResolveLargeImage, which returns a URL (black included), never an
-  // empty string.
-  const std::string black = PresenceLayout::kFallbackLargeImageUrl;
-  Check(!black.empty(), "pending: the resolver never yields an empty image url");
-  Check(black == PresenceLayout::BuildLargeImage(""),
-        "pending: an empty artwork url resolves to the black png, not a blank");
-  Check(ResolveCoverLayer("", "", "") == CoverLayer::kBlackPng,
-        "pending: with nothing resolved yet the black png still holds the card");
-
-  // The existing gate: a previous large_image is held until a *new* value is
-  // resolved. Applying the same value is a no-op, so a pending publish cannot
-  // blank the card by re-applying black over black.
+  // have resolved either; the resolver then yields an empty image field, which
+  // the wire builder omits (AppendImageField skips empties), so Discord shows
+  // its native placeholder instead of a stand-in. The *card* is not blanked
+  // because the plugin holds the previous large_image until a *new* value is
+  // resolved: applying the same value is a no-op, so a pending publish cannot
+  // clear the image by re-applying an empty over an empty.
   const std::string key = AlbumArt::BuildAlbumKey("Daft Punk", "Discovery", "");
   const std::string resolved_pending =
       PresenceLayout::ResolveLargeImage(key, "", "", "", "", nullptr);
-  Check(resolved_pending == black,
-        "pending: no local url and no online url resolves to the black png");
-  // Once a local or online URL lands, it differs from black and is applied.
+  Check(resolved_pending.empty(),
+        "pending: no local url and no online url resolves to an empty image field");
+  std::string source;
+  Check(PresenceLayout::ResolveLargeImage(key, "", "", "", "", &source).empty() &&
+            source == "none",
+        "pending: the empty field names its source");
+  Check(ResolveCoverLayer("", "", "") == CoverLayer::kNoImage,
+        "pending: with nothing resolved yet the no-image layer holds");
+  // Once a local or online URL lands, it differs from empty and is applied.
   const std::string after_publish =
       PresenceLayout::ResolveLargeImage(key, key, "https://n.uguu.se/abc.png", "", "", nullptr);
-  Check(after_publish != resolved_pending,
+  Check(!after_publish.empty() && after_publish != resolved_pending,
         "pending: a landed local url is a change the card applies");
 }
 
@@ -872,7 +862,7 @@ void TestOnlineRungDecision() {
         "online rung: an empty artist suppresses the lookup");
 
   // Resolved: a provider hit that survives the identity guard yields its URL,
-  // and the resolved URL is what the plugin applies - black is not used.
+  // and the resolved URL is what the plugin applies - no stand-in is used.
   const std::string deezer_body =
       "{\"data\":[{\"title\":\"Discovery\",\"artist\":{\"name\":\"Daft Punk\"},"
       "\"cover_xl\":\"https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg\"}],"
@@ -888,8 +878,8 @@ void TestOnlineRungDecision() {
       PresenceLayout::ResolveLargeImage(key, "", "", key, deezer_url, &source);
   Check(applied == deezer_url && source == "online",
         "online rung: a resolved url is applied as the online image");
-  Check(applied != PresenceLayout::kFallbackLargeImageUrl,
-        "online rung: black is not used when a provider resolved");
+  Check(!applied.empty(),
+        "online rung: the field is not empty when a provider resolved");
 
   const std::string itunes_match =
       "{\"resultCount\":1,\"results\":[{\"artistName\":\"Daft Punk\","
@@ -902,7 +892,7 @@ void TestOnlineRungDecision() {
         "online rung: the itunes artwork url is upscaled to 600x600");
 
   // Not found: every provider answered and none matched, so the resolver
-  // reports no URL and the plugin falls back to the black PNG.
+  // reports no URL and the plugin sends no image (field omitted).
   const std::string dbz_artist = "Dragon Ball Z";
   const std::string dbz_album = "Dragon Ball Z BGM Collection Disc 1";
   const std::string dbz_key = AlbumArt::BuildAlbumKey(dbz_artist, dbz_album, "");
@@ -930,16 +920,15 @@ void TestOnlineRungDecision() {
   Check(AlbumArt::ExtractMusicBrainzReleaseGroupId(musicbrainz_empty).empty(),
         "online rung: an empty musicbrainz answer yields no mbid");
 
-  const std::string fallback =
+  const std::string empty =
       PresenceLayout::ResolveLargeImage(dbz_key, "", "", dbz_key, "", &source);
-  Check(fallback == PresenceLayout::kFallbackLargeImageUrl && source == "fallback",
-        "online rung: not-found falls back to the black png");
-  Check(fallback != deezer_url, "online rung: the fallback is not another album's url");
+  Check(empty.empty() && source == "none",
+        "online rung: not-found sends no image");
+  Check(empty != deezer_url, "online rung: the empty field is not another album's url");
 
   // A URL resolved for a different identity is never adopted for this one.
   const std::string other_key = AlbumArt::BuildAlbumKey(artist, "Homework", "");
-  Check(PresenceLayout::ResolveLargeImage(key, "", "", other_key, deezer_url, &source) ==
-            PresenceLayout::kFallbackLargeImageUrl,
+  Check(PresenceLayout::ResolveLargeImage(key, "", "", other_key, deezer_url, &source).empty(),
         "online rung: another album's resolved url is never applied");
 }
 
@@ -948,7 +937,7 @@ void TestOnlineRungDecision() {
 // (1) the request predicate fires; (2) album-empty is no longer a definitive
 // nothing-to-query case; (3) an artist-only hit is accepted; (4) a wrong-album
 // hit is still rejected when the request names an album; (5) album-less keys
-// stay file-path distinct; (6) the decision table picks online over black.
+// stay file-path distinct; (6) the decision table picks online when it resolves.
 
 void TestAlbumlessOnlineRung() {
   const std::string artist = "Daft Punk";
@@ -1010,17 +999,14 @@ void TestAlbumlessOnlineRung() {
   Check(key_a != artist + "\n",
         "albumless: the key does not collapse to artist + newline");
 
-  // (6) Decision table: album-less + online-resolved => the ONLINE url is chosen,
-  // not the black PNG.
+  // (6) Decision table: album-less + online-resolved => the ONLINE url is chosen.
   const std::string applied =
       PresenceLayout::ResolveLargeImage(key_a, "", "", key_a, online_url, &source);
   Check(applied == online_url && source == "online",
-        "albumless: the online url is chosen over the black png");
-  Check(applied != PresenceLayout::kFallbackLargeImageUrl,
-        "albumless: the black png is not chosen when online resolved");
+        "albumless: the online url is chosen when it resolves");
   const std::string unresolved =
       PresenceLayout::ResolveLargeImage(key_b, "", "", key_a, online_url, &source);
-  Check(unresolved == PresenceLayout::kFallbackLargeImageUrl && source == "fallback",
+  Check(unresolved.empty() && source == "none",
         "albumless: a url resolved for another file's key is not adopted");
 }
 
@@ -1373,7 +1359,7 @@ void TestSidecarSelection() {
         "sidecar: each level is judged on its own entries");
 
   // (7) No image anywhere in range -> empty, so the caller falls through to the
-  // online rung rather than black.
+  // online rung, which may still supply an image.
   Check(SidecarLevels({{L"a.flac"}, {L"b.flac"}, {L"c.flac"}, {L"d.flac"},
                        {L"cover.txt"}}) == -1,
         "sidecar: no image in range yields nothing");
@@ -1447,6 +1433,70 @@ void TestCache(const std::wstring& directory) {
   RemoveDirectoryW(directory.c_str());
 }
 
+// --- Ephemeral cache entries: upgrade vs revalidate --------------------------
+//
+// A cache hit on a keyless URL is never trusted blindly. With the permanent
+// GitHub host active the local bytes are re-published there (the Death Note
+// case: a dead cached uguu URL becomes a raw.githubusercontent URL and the
+// cache is updated); without a token the stored URL is revalidated and a dead
+// entry falls through to a fresh keyless upload. The planning is pure, so it
+// is asserted here; the network legs (GitHub PUT, health-check GET, fresh
+// upload) are the existing proven transports.
+
+void TestCachedUrlPlan() {
+  const std::string uguu_url = "https://n.uguu.se/nUoxUKCo.png";
+  const std::string catbox_url = "https://files.catbox.moe/a1b2c3.png";
+  const std::string litterbox_url = "https://litter.catbox.moe/abc123.png";
+  const std::string github_name(64, 'a');
+  const std::string github_url =
+      "https://raw.githubusercontent.com/nathwn12/aimp-discord-presence-art/main/covers/" +
+      github_name + ".jpg";
+
+  // Every keyless host's URL is ephemeral, whatever the subdomain or extension.
+  Check(IsEphemeralCachedUrl(uguu_url), "plan: a uguu url is ephemeral");
+  Check(IsEphemeralCachedUrl("https://h.uguu.se/yHYDFJRh.jpg"),
+        "plan: a uguu url on another subdomain is ephemeral");
+  Check(IsEphemeralCachedUrl(catbox_url), "plan: a catbox url is ephemeral");
+  Check(IsEphemeralCachedUrl(litterbox_url), "plan: a litterbox url is ephemeral");
+  Check(!IsEphemeralCachedUrl(github_url), "plan: a github raw url is not ephemeral");
+  Check(IsGitHubCachedUrl(github_url), "plan: a github raw url is durable");
+  Check(!IsGitHubCachedUrl(uguu_url), "plan: a uguu url is not durable");
+  Check(LooksLikeUploadUrl(github_url), "plan: the github raw url is a recognised upload url");
+
+  // With the GitHub host active, every ephemeral hit is upgraded.
+  Check(PlanCachedUrl(uguu_url, true) == CachedUrlAction::kUpgradeToGitHub,
+        "plan: uguu hit + token -> re-publish to github");
+  Check(PlanCachedUrl(catbox_url, true) == CachedUrlAction::kUpgradeToGitHub,
+        "plan: catbox hit + token -> re-publish to github");
+  Check(PlanCachedUrl(litterbox_url, true) == CachedUrlAction::kUpgradeToGitHub,
+        "plan: litterbox hit + token -> re-publish to github");
+  Check(PlanCachedUrl(github_url, true) == CachedUrlAction::kUse,
+        "plan: github hit + token -> used as-is, never re-uploaded");
+
+  // Without a token, an ephemeral hit is revalidated, never trusted blindly.
+  Check(PlanCachedUrl(uguu_url, false) == CachedUrlAction::kRevalidate,
+        "plan: uguu hit, no token -> revalidate");
+  Check(PlanCachedUrl(catbox_url, false) == CachedUrlAction::kRevalidate,
+        "plan: catbox hit, no token -> revalidate");
+  Check(PlanCachedUrl(litterbox_url, false) == CachedUrlAction::kRevalidate,
+        "plan: litterbox hit, no token -> revalidate");
+  Check(PlanCachedUrl(github_url, false) == CachedUrlAction::kUse,
+        "plan: github hit, no token -> still used as-is");
+
+  // The active flag mirrors the host list: a token with a malformed repo is
+  // present-but-unused, exactly like no token.
+  CoverPublisher::ConfigureAuth("test-token", "");
+  Check(GitHubUploadActive(), "plan: token + default repo -> github active");
+  Check(PlanCachedUrl(uguu_url, GitHubUploadActive()) == CachedUrlAction::kUpgradeToGitHub,
+        "plan: the live active flag upgrades an ephemeral hit");
+  CoverPublisher::ConfigureAuth("test-token", "no-slash-here");
+  Check(!GitHubUploadActive(), "plan: token + malformed repo -> github inactive");
+  Check(PlanCachedUrl(uguu_url, GitHubUploadActive()) == CachedUrlAction::kRevalidate,
+        "plan: present-but-unused token still revalidates");
+  CoverPublisher::ConfigureAuth("", "");
+  Check(!GitHubUploadActive(), "plan: no token -> github inactive");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1478,6 +1528,7 @@ int main(int argc, char** argv) {
   TestCompressionPreparation();
   TestSidecarSelection();
   TestCache(directory);
+  TestCachedUrlPlan();
 
   std::printf("cover_publisher tests: %d checks, %d failures\n", g_checks, g_failures);
   std::printf("RESULT: %s\n", g_failures == 0 ? "PASS" : "FAIL");

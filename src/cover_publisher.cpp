@@ -182,6 +182,14 @@ bool GitHubTokenPresent() {
   return !g_github_token.empty();
 }
 
+// The GitHub host is usable only when a token AND a parseable repo are
+// configured - the same condition ActiveHosts() uses to prepend it. A token
+// with a malformed repo is present-but-unused, exactly like no token.
+bool GitHubUploadActive() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  return !g_github_token.empty() && !g_github_owner.empty() && !g_github_repo.empty();
+}
+
 // Each host owns the exact URL shape it answers with, so a lookalike host
 // ("...moe.evil.test") or a body that is not that host's URL is rejected. The
 // success response is a bare https URL matching the host that answered; a WAF
@@ -255,6 +263,37 @@ bool LooksLikeHostUrl(const std::string& text, const UploadHost& upload_host) {
   };
   const auto found = patterns.find(url_pattern);
   return found != patterns.end() && std::regex_match(text, found->second);
+}
+
+// A cached URL on a keyless host (catbox, uguu, litterbox) is ephemeral: it
+// can die while the cache entry lives (measured: a uguu URL answering 404
+// months later). A GitHub raw URL is the owner's own permanent repo. The
+// cache only ever stores URLs that pass LooksLikeUploadUrl, so an unknown
+// shape passes through as durable - it can only be a future host's URL.
+bool IsEphemeralCachedUrl(const std::string& url) {
+  return LooksLikeHostUrl(url, UploadHost{L"", L"", L"", UploadShape::kCatbox}) ||
+         LooksLikeHostUrl(url, UploadHost{L"", L"", L"", UploadShape::kUguu}) ||
+         LooksLikeHostUrl(url, UploadHost{L"", L"", L"", UploadShape::kLitterbox});
+}
+
+bool IsGitHubCachedUrl(const std::string& url) {
+  return LooksLikeHostUrl(url, UploadHost{L"", L"", L"", UploadShape::kGitHub});
+}
+
+// What a cache hit needs: use it as-is, re-publish the local bytes to the
+// permanent GitHub host, or revalidate the stored URL before trusting it.
+// Pure, so the policy is testable without a network.
+enum class CachedUrlAction {
+  kUse,             // durable (GitHub) or unknown shape: answer the hit
+  kUpgradeToGitHub,  // ephemeral URL, token configured: re-publish to GitHub
+  kRevalidate,       // ephemeral URL, no token: health-check, re-publish if dead
+};
+
+CachedUrlAction PlanCachedUrl(const std::string& url, bool github_active) {
+  if (!IsEphemeralCachedUrl(url)) {
+    return CachedUrlAction::kUse;
+  }
+  return github_active ? CachedUrlAction::kUpgradeToGitHub : CachedUrlAction::kRevalidate;
 }
 
 std::string SanitizeMime(const char* mime) {
@@ -1571,6 +1610,22 @@ HostOutcome TryUploadHost(const UploadHost& upload_host, const PreparedImage& pr
   return outcome;
 }
 
+// Uploads to the permanent GitHub host only: the upgrade path for a cache hit
+// on an ephemeral keyless URL. The caller falls back to revalidation when this
+// fails, so a dead ephemeral URL is never sent. Answers github-not-configured
+// without touching the network when the host is not active.
+HostOutcome TryGitHubUpload(const PreparedImage& prepared) {
+  const std::vector<UploadHost> hosts = ActiveHosts();
+  for (size_t i = 0; i < hosts.size(); ++i) {
+    if (hosts[i].shape == UploadShape::kGitHub) {
+      return TryUploadHost(hosts[i], prepared);
+    }
+  }
+  HostOutcome outcome;
+  outcome.result = Failure("github-not-configured");
+  return outcome;
+}
+
 // Every configured host, in order, in one comma-separated token for the failure
 // marker: "github.com,catbox.moe,uguu.se,litter.catbox.moe".
 std::string HostListToken() {
@@ -1682,8 +1737,42 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
     const long long now = static_cast<long long>(std::time(nullptr));
     Result cached;
     if (CacheLookup(key, now, &cached)) {
-      cached.detail = prepared.note + " key=" + key + " cache=hit";
-      return cached;
+      if (!cached.ok) {
+        cached.detail = prepared.note + " key=" + key + " cache=hit";
+        return cached;
+      }
+      // A hit on an ephemeral keyless URL is never trusted blindly: with a
+      // token the local bytes are re-published to the permanent GitHub host
+      // and the cache is updated; without one the stored URL is revalidated
+      // and a dead entry falls through to a fresh keyless upload below, which
+      // overwrites it. Either way a dead cached URL is never sent.
+      const CachedUrlAction action = PlanCachedUrl(cached.url, GitHubUploadActive());
+      if (action == CachedUrlAction::kUse) {
+        cached.detail = prepared.note + " key=" + key + " cache=hit";
+        return cached;
+      }
+      if (action == CachedUrlAction::kUpgradeToGitHub) {
+        const HostOutcome upgrade = TryGitHubUpload(prepared);
+        if (upgrade.result.ok) {
+          Result result = upgrade.result;
+          LogHostSuccess(result);
+          result.detail = prepared.note + " key=" + key +
+                          " cache=upgraded-from-ephemeral attempts=" +
+                          std::to_string(upgrade.attempts) + " host=" + result.host;
+          CacheStore(key, result, now);
+          return result;
+        }
+        EmitLog("local-cover upgrade-failed key=" + key + " reason=" +
+                upgrade.result.reason + " host=" + upgrade.result.host);
+        // Fall through to revalidation: a failed upgrade must not resurrect a
+        // possibly-dead ephemeral URL.
+      }
+      const HealthCheck health = HealthCheckUrl(cached.url);
+      if (health.ok) {
+        cached.detail = prepared.note + " key=" + key + " cache=hit-revalidated";
+        return cached;
+      }
+      EmitLog("local-cover cache-stale key=" + key + " reason=" + health.reason);
     }
 
     // Ordered fallback inside one publish: GitHub first when a token is set
