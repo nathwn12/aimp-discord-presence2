@@ -29,10 +29,13 @@
 //                        the literal "AIMP", so the line is never blank
 //   state      (line 3)  the artist; falls back to the album, and is
 //                        omitted when that would repeat `details`
-//   large_text           the album (the album-art tooltip); omitted when it
-//                        would repeat `details` or `state`
 //   large_image          the resolved album art URL; the black PNG URL when no
 //                        art was resolved (never an asset key, never empty)
+//
+// Spotify parity is two text lines only: there is no album third line, so no
+// `large_text` is ever emitted; the cover art image is kept via `large_image`
+// alone. `TextFields::large_text` is therefore always empty (retained only so
+// existing initializers keep compiling).
 //
 // No field repeats a value already emitted by an earlier one; empty values
 // count as absent.
@@ -58,15 +61,19 @@ constexpr const char* kFallbackDetails = "AIMP";
 struct TextFields {
   std::string details;     // title, else artist, else kFallbackDetails
   std::string state;       // artist, else album; empty omits the field
-  std::string large_text;  // album; empty omits the field
+  std::string large_text;  // always empty: no album third line (Spotify parity)
 };
 
-// Title -> artist -> album, de-duplicated (Spotify parity: the track title is
-// the prominent line, the artist is second). `details` is never empty;
-// `state` falls back to the album only when the artist is empty or would
-// repeat `details`; `large_text` is dropped when the album would repeat either
-// line. Truncation stays downstream (NormalizeTextField, 128 codepoints), so
-// this builder does no cutting itself.
+// Title -> artist, de-duplicated (Spotify parity: the track title is the
+// prominent line, the artist is second). `details` is never empty; `state`
+// keeps the artist when the tag exists, falls back to the album only when the
+// artist is empty or would repeat `details`, and is omitted when it would
+// repeat `details` - so line 2 always reads as the artist/band when known,
+// falls back to the album for untagged tracks, and never duplicates line 1.
+// `large_text` is always cleared: the card is two text lines plus the cover
+// image, with no album tooltip line. Truncation stays downstream
+// (NormalizeTextField, 128 codepoints), so this builder does no cutting
+// itself.
 inline TextFields BuildTextFields(const std::string& artist,
                                   const std::string& album,
                                   const std::string& title) {
@@ -82,11 +89,7 @@ inline TextFields BuildTextFields(const std::string& artist,
     fields.state.clear();
   }
 
-  fields.large_text = album;
-  if (fields.large_text.empty() || fields.large_text == fields.details ||
-      fields.large_text == fields.state) {
-    fields.large_text.clear();
-  }
+  fields.large_text.clear();
 
   return fields;
 }

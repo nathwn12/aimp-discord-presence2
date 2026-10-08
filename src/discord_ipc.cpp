@@ -485,7 +485,8 @@ std::string BuildActivityJson(const Activity& activity) {
 
   std::string assets;
   AppendImageField(assets, "large_image", activity.large_image);
-  AppendTextField(assets, "large_text", activity.large_text);
+  // Spotify parity: two text lines only - the album third line (`large_text`)
+  // is never emitted; the cover art image (`large_image`) is kept.
   AppendImageField(assets, "small_image", activity.small_image);
   AppendTextField(assets, "small_text", activity.small_text);
   if (!assets.empty()) {
